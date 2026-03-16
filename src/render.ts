@@ -12,11 +12,11 @@ function ensureInit(): Promise<void> {
 }
 
 /** Render an SVG string to a PNG Uint8Array (800x800). */
-export async function svgToPng(svg: string): Promise<Uint8Array> {
+export async function svgToPng(svg: string): Promise<Uint8Array<ArrayBuffer>> {
 	await ensureInit();
 	const resvg = new Resvg(svg, {
 		fitTo: { mode: 'width', value: 800 },
 	});
 	const rendered = resvg.render();
-	return rendered.asPng();
+	return rendered.asPng() as Uint8Array<ArrayBuffer>;
 }
