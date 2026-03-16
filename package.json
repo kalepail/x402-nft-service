@@ -6,14 +6,25 @@
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
-		"test": "vitest",
+		"test": "vitest run",
+		"test:watch": "vitest",
+		"test:testnet": "tsx scripts/test-testnet.ts",
 		"cf-typegen": "wrangler types"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.12.4",
+		"@stellar/stellar-sdk": "^14.6.1",
 		"@types/node": "^25.5.0",
+		"tsx": "^4.21.0",
 		"typescript": "^5.5.2",
 		"vitest": "~3.2.0",
 		"wrangler": "^4.74.0"
+	},
+	"dependencies": {
+		"@resvg/resvg-wasm": "^2.6.2",
+		"@x402/core": "^2.7.0",
+		"@x402/hono": "^2.7.0",
+		"@x402/stellar": "^2.7.0",
+		"hono": "^4.12.8"
 	}
 }
