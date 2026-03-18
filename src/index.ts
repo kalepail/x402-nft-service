@@ -1,6 +1,8 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { Keypair } from '@stellar/stellar-sdk';
 import { x402Middleware, type X402RouteConfig } from './x402';
+import type { ChannelConfig } from './channel';
 import { STYLES, STYLE_KEYS, type StyleKey } from './generators';
 import { svgToPng } from './render';
 
@@ -8,11 +10,14 @@ import { svgToPng } from './render';
 const USDC_TESTNET = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA';
 const DEFAULT_FACILITATOR = 'https://x402.org/facilitator';
 const PRICE_AMOUNT = '1000000'; // $0.10 USDC (7 decimals)
+const PRICE_BIGINT = 1_000_000n;
 const NETWORK = 'stellar:testnet';
 
 type Bindings = {
 	STELLAR_PAY_TO: string;
 	FACILITATOR_URL?: string;
+	/** Server secret key for counter-signing channel states. Set as a Worker secret. */
+	CHANNEL_SERVER_SECRET?: string;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -42,7 +47,16 @@ app.use('/mint/*', async (c, next) => {
 		};
 	}
 
-	const mw = x402Middleware(facilitatorUrl, routeConfigs);
+	// Enable channel scheme if server secret is configured
+	let channelConfig: ChannelConfig | undefined;
+	if (c.env.CHANNEL_SERVER_SECRET) {
+		channelConfig = {
+			serverKeypair: Keypair.fromSecret(c.env.CHANNEL_SERVER_SECRET),
+			price: PRICE_BIGINT,
+		};
+	}
+
+	const mw = x402Middleware(facilitatorUrl, routeConfigs, channelConfig);
 	return mw(c, next);
 });
 
@@ -182,6 +196,29 @@ app.get('/.well-known/x402.json', (c) => {
 	const baseUrl = new URL(c.req.url).origin;
 	const payTo = c.env.STELLAR_PAY_TO;
 
+	const exactScheme = {
+		scheme: 'exact',
+		network: NETWORK,
+		asset: USDC_TESTNET,
+		amount: PRICE_AMOUNT,
+		payTo,
+		maxTimeoutSeconds: 60,
+		extra: { areFeesSponsored: true },
+	};
+
+	const accepts: unknown[] = [exactScheme];
+
+	if (c.env.CHANNEL_SERVER_SECRET) {
+		const serverKeypair = Keypair.fromSecret(c.env.CHANNEL_SERVER_SECRET);
+		accepts.push({
+			scheme: 'channel',
+			network: NETWORK,
+			asset: USDC_TESTNET,
+			price: PRICE_AMOUNT,
+			serverPublicKey: serverKeypair.publicKey(),
+		});
+	}
+
 	return c.json({
 		x402Version: 2,
 		facilitator: c.env.FACILITATOR_URL || DEFAULT_FACILITATOR,
@@ -191,17 +228,7 @@ app.get('/.well-known/x402.json', (c) => {
 			url: `${baseUrl}/mint/${key}`,
 			description: STYLES[key].description,
 			mimeType: 'image/png',
-			accepts: [
-				{
-					scheme: 'exact',
-					network: NETWORK,
-					asset: USDC_TESTNET,
-					amount: PRICE_AMOUNT,
-					payTo,
-					maxTimeoutSeconds: 60,
-					extra: { areFeesSponsored: true },
-				},
-			],
+			accepts,
 		})),
 	});
 });

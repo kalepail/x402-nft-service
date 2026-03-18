@@ -1,5 +1,6 @@
 import { Buffer } from 'node:buffer';
-import type { MiddlewareHandler } from 'hono';
+import type { Context, MiddlewareHandler, Next } from 'hono';
+import { verifyChannelPayment, type ChannelConfig, type ChannelPaymentHeader, type ChannelPaymentResponse } from './channel';
 
 const X402_VERSION = 2;
 
@@ -28,12 +29,19 @@ export interface X402RouteConfig {
 }
 
 /**
- * Minimal x402 middleware implementing the server-side HTTP 402 payment flow.
+ * x402 middleware supporting both exact and channel payment schemes.
  *
- * 1. No payment header → 402 with PAYMENT-REQUIRED header
- * 2. Payment header → verify with facilitator → execute handler → settle
+ * - Exact scheme: verify/settle via facilitator (on-chain per request)
+ * - Channel scheme: verify locally via ed25519 (off-chain, ~microseconds)
+ *
+ * When channelConfig is provided, the 402 response advertises both schemes.
+ * Clients choose which to use based on their needs.
  */
-export function x402Middleware(facilitatorUrl: string, routeConfigs: Record<string, X402RouteConfig>): MiddlewareHandler {
+export function x402Middleware(
+	facilitatorUrl: string,
+	routeConfigs: Record<string, X402RouteConfig>,
+	channelConfig?: ChannelConfig,
+): MiddlewareHandler {
 	return async (c, next) => {
 		const pathname = new URL(c.req.url).pathname;
 		const routeKey = `${c.req.method} ${pathname}`;
@@ -46,68 +54,149 @@ export function x402Middleware(facilitatorUrl: string, routeConfigs: Record<stri
 		const paymentHeader = c.req.header('payment-signature') || c.req.header('x-payment');
 
 		if (!paymentHeader) {
-			const paymentRequired = {
-				x402Version: X402_VERSION,
-				resource: { url: c.req.url, description: config.description, mimeType: config.mimeType },
-				accepts: [config.requirements],
-			};
-			return c.json(paymentRequired, 402, {
-				'PAYMENT-REQUIRED': toBase64(JSON.stringify(paymentRequired)),
-			});
+			return send402(c, config, channelConfig);
 		}
 
-		let paymentPayload: unknown;
-		try {
-			paymentPayload = JSON.parse(fromBase64(paymentHeader));
-		} catch {
-			return c.json({ error: 'Invalid payment header encoding' }, 400);
+		// Detect channel scheme: the header is raw JSON with scheme field
+		// Exact scheme: the header is base64-encoded JSON
+		const channelPayment = tryParseChannelHeader(paymentHeader);
+
+		if (channelPayment && channelConfig) {
+			return handleChannelPayment(c, next, channelPayment, channelConfig);
 		}
 
-		// Verify with facilitator
-		let verification: { isValid?: boolean; invalidReason?: string };
+		// Fall through to exact scheme
+		return handleExactPayment(c, next, paymentHeader, facilitatorUrl, config);
+	};
+}
+
+// ── Channel scheme (local verification, no facilitator) ──────────────────────
+
+function tryParseChannelHeader(header: string): ChannelPaymentHeader | null {
+	try {
+		const parsed = JSON.parse(header);
+		if (parsed && parsed.scheme === 'channel' && parsed.channelId && parsed.agentSig) {
+			return parsed as ChannelPaymentHeader;
+		}
+	} catch {
+		// Not JSON — likely base64-encoded exact scheme
+	}
+	return null;
+}
+
+async function handleChannelPayment(
+	c: Context,
+	next: Next,
+	header: ChannelPaymentHeader,
+	config: ChannelConfig,
+): Promise<Response | void> {
+	const result = verifyChannelPayment(header, config);
+
+	if (!result.valid) {
+		return c.json({ error: result.error }, 402);
+	}
+
+	// Execute the route handler
+	await next();
+
+	// Attach counter-signature to successful responses
+	if (c.res.status < 400 && result.counterSig) {
+		const responseHeader: ChannelPaymentResponse = {
+			scheme: 'channel',
+			channelId: header.channelId,
+			iteration: header.iteration,
+			serverSig: result.counterSig,
+		};
+		const headers = new Headers(c.res.headers);
+		headers.set('X-Payment-Response', JSON.stringify(responseHeader));
+		c.res = new Response(c.res.body, { status: c.res.status, statusText: c.res.statusText, headers });
+	}
+}
+
+// ── Exact scheme (facilitator-based verification) ────────────────────────────
+
+async function handleExactPayment(
+	c: Context,
+	next: Next,
+	paymentHeader: string,
+	facilitatorUrl: string,
+	config: X402RouteConfig,
+): Promise<Response | void> {
+	let paymentPayload: unknown;
+	try {
+		paymentPayload = JSON.parse(fromBase64(paymentHeader));
+	} catch {
+		return c.json({ error: 'Invalid payment header encoding' }, 400);
+	}
+
+	// Verify with facilitator
+	let verification: { isValid?: boolean; invalidReason?: string };
+	try {
+		const resp = await fetch(`${facilitatorUrl}/verify`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ x402Version: X402_VERSION, paymentPayload, paymentRequirements: config.requirements }),
+		});
+		verification = (await resp.json()) as typeof verification;
+	} catch (err) {
+		return c.json({ error: 'Facilitator unreachable', detail: String(err) }, 502);
+	}
+
+	if (!verification.isValid) {
+		const errPayload = {
+			x402Version: X402_VERSION,
+			error: verification.invalidReason || 'Payment verification failed',
+			resource: { url: c.req.url },
+			accepts: [config.requirements],
+		};
+		return c.json(errPayload, 402, {
+			'PAYMENT-REQUIRED': toBase64(JSON.stringify(errPayload)),
+		});
+	}
+
+	// Execute the route handler
+	await next();
+
+	// Only settle if the handler succeeded
+	if (c.res.status < 400) {
 		try {
-			const resp = await fetch(`${facilitatorUrl}/verify`, {
+			const resp = await fetch(`${facilitatorUrl}/settle`, {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ x402Version: X402_VERSION, paymentPayload, paymentRequirements: config.requirements }),
 			});
-			verification = (await resp.json()) as typeof verification;
-		} catch (err) {
-			return c.json({ error: 'Facilitator unreachable', detail: String(err) }, 502);
+			const settlement = await resp.json();
+			const headers = new Headers(c.res.headers);
+			headers.set('PAYMENT-RESPONSE', toBase64(JSON.stringify(settlement)));
+			c.res = new Response(c.res.body, { status: c.res.status, statusText: c.res.statusText, headers });
+		} catch {
+			console.error('x402: settlement call failed');
 		}
+	}
+}
 
-		if (!verification.isValid) {
-			const errPayload = {
-				x402Version: X402_VERSION,
-				error: verification.invalidReason || 'Payment verification failed',
-				resource: { url: c.req.url },
-				accepts: [config.requirements],
-			};
-			return c.json(errPayload, 402, {
-				'PAYMENT-REQUIRED': toBase64(JSON.stringify(errPayload)),
-			});
-		}
+// ── 402 response ─────────────────────────────────────────────────────────────
 
-		// Execute the route handler
-		await next();
+function send402(c: Context, config: X402RouteConfig, channelConfig?: ChannelConfig): Response {
+	const accepts: unknown[] = [config.requirements];
 
-		// Only settle if the handler succeeded
-		if (c.res.status < 400) {
-			try {
-				const resp = await fetch(`${facilitatorUrl}/settle`, {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ x402Version: X402_VERSION, paymentPayload, paymentRequirements: config.requirements }),
-				});
-				const settlement = await resp.json();
-				// Attach settlement receipt to response
-				const headers = new Headers(c.res.headers);
-				headers.set('PAYMENT-RESPONSE', toBase64(JSON.stringify(settlement)));
-				c.res = new Response(c.res.body, { status: c.res.status, statusText: c.res.statusText, headers });
-			} catch {
-				// Settlement failed — still return the resource but log the failure
-				console.error('x402: settlement call failed');
-			}
-		}
+	if (channelConfig) {
+		accepts.push({
+			scheme: 'channel',
+			price: String(channelConfig.price),
+			network: config.requirements.network,
+			asset: config.requirements.asset,
+			serverPublicKey: channelConfig.serverKeypair.publicKey(),
+		});
+	}
+
+	const paymentRequired = {
+		x402Version: X402_VERSION,
+		resource: { url: c.req.url, description: config.description, mimeType: config.mimeType },
+		accepts,
 	};
+
+	return c.json(paymentRequired, 402, {
+		'PAYMENT-REQUIRED': toBase64(JSON.stringify(paymentRequired)),
+	});
 }

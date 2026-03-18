@@ -22,6 +22,7 @@
 	},
 	"dependencies": {
 		"@resvg/resvg-wasm": "^2.6.2",
+		"@stellar/stellar-sdk": "^14.6.1",
 		"@x402/core": "^2.7.0",
 		"@x402/hono": "^2.7.0",
 		"@x402/stellar": "^2.7.0",
