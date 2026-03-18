@@ -1,0 +1,6 @@
+# Copy to .dev.vars and fill in values for local development (wrangler dev)
+# See wrangler.jsonc for non-secret vars (STELLAR_PAY_TO, FACILITATOR_URL)
+
+# Optional: enables the off-chain channel payment scheme.
+# Generate with: node -e "console.log(require('@stellar/stellar-sdk').Keypair.random().secret())"
+CHANNEL_SERVER_SECRET=S...
