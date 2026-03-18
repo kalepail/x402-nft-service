@@ -1,7 +1,13 @@
 import { mulberry32, noise2D } from './rng';
 
-const SIZE = 800;
+const DEFAULT_SIZE = 800;
 const TAU = Math.PI * 2;
+
+/** Clamp requested size to valid range. */
+export function clampSize(s: number | undefined): number {
+	if (!s || isNaN(s)) return DEFAULT_SIZE;
+	return Math.max(32, Math.min(DEFAULT_SIZE, Math.round(s)));
+}
 
 // ─── Color helpers ──────────────────────────────────────────────────────────
 
@@ -16,8 +22,13 @@ function palette(rng: () => number, count: number): string[] {
 	return Array.from({ length: count }, (_, i) => hsl((base + i * spread) % 360, 80 + rng() * 15, 62 + rng() * 16));
 }
 
-function svgWrap(bg: string, content: string): string {
-	return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${SIZE} ${SIZE}"><rect width="${SIZE}" height="${SIZE}" fill="${bg}"/>${content}</svg>`;
+function svgWrap(bg: string, content: string, size: number): string {
+	return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${size} ${size}"><rect width="${size}" height="${size}" fill="${bg}"/>${content}</svg>`;
+}
+
+/** Coordinate formatter — use integers for small sizes, 1 decimal for large. */
+function fmt(v: number, size: number): string {
+	return size <= 200 ? String(Math.round(v)) : v.toFixed(1);
 }
 
 // ─── 1. De Jong Attractor ("Strange Attractor") ────────────────────────────
@@ -39,13 +50,14 @@ const KNOWN_GOOD_PARAMS: [number, number, number, number][] = [
 	[1.1, -1.32, 2.04, 1.54],
 ];
 
-export function cliffordAttractor(seed: number): string {
+export function cliffordAttractor(seed: number, size = DEFAULT_SIZE): string {
 	const rng = mulberry32(seed);
 	const hueBase = rng() * 360;
-	const ITERS = 200_000;
-	const GRID = 200; // density grid resolution
-	const PX = SIZE / GRID; // pixel size
-	const MIN_FILLED_CELLS = 500; // minimum occupied cells to avoid black images
+	const scale = size / DEFAULT_SIZE;
+	const GRID = Math.max(20, Math.round(200 * scale)); // density grid resolution
+	const ITERS = Math.max(5_000, Math.round(200_000 * scale * scale)); // scale with area
+	const PX = size / GRID; // pixel size
+	const MIN_FILLED_CELLS = Math.max(50, Math.round(500 * scale * scale));
 
 	// Try parameter sets until we find one that fills enough cells
 	let density: Float32Array;
@@ -114,6 +126,7 @@ export function cliffordAttractor(seed: number): string {
 	// Render: each occupied cell becomes a small colored rect
 	let rects = '';
 	const logMax = Math.log(maxD + 1);
+	const pw = size <= 200 ? Math.round(PX) : +PX.toFixed(1);
 	for (let gy = 0; gy < GRID; gy++) {
 		for (let gx = 0; gx < GRID; gx++) {
 			const d = density[gy * GRID + gx];
@@ -124,48 +137,51 @@ export function cliffordAttractor(seed: number): string {
 			const lit = 15 + t * 65;
 			const sx = gx * PX;
 			const sy = gy * PX;
-			rects += `<rect x="${sx.toFixed(1)}" y="${sy.toFixed(1)}" width="${PX}" height="${PX}" fill="${hsl(hue, sat, lit)}"/>`;
+			rects += `<rect x="${fmt(sx, size)}" y="${fmt(sy, size)}" width="${pw}" height="${pw}" fill="${hsl(hue, sat, lit)}"/>`;
 		}
 	}
 
-	return svgWrap('#0a0a0e', rects);
+	return svgWrap('#0a0a0e', rects, size);
 }
 
 // ─── 2. Flow Field ("Neural Flow") ─────────────────────────────────────────
 
-export function flowField(seed: number): string {
+export function flowField(seed: number, size = DEFAULT_SIZE): string {
 	const rng = mulberry32(seed);
 	const noiseSeed = (seed * 7919) | 0;
-	const scale = 0.005 + rng() * 0.01;
+	const sc = size / DEFAULT_SIZE;
+	const noiseScale = 0.005 + rng() * 0.01;
 	const turbulence = 2 + rng() * 3;
 	const colors = palette(rng, 5);
-	const PARTICLES = 600;
-	const STEPS = 120;
-	const STEP_SIZE = 2;
+	const PARTICLES = Math.max(30, Math.round(600 * sc * sc));
+	const STEPS = Math.max(20, Math.round(120 * sc));
+	const STEP_SIZE = 2 * sc;
 
 	let out = '';
 	for (let p = 0; p < PARTICLES; p++) {
-		let px = rng() * SIZE;
-		let py = rng() * SIZE;
-		const pts: string[] = [`M${px.toFixed(1)} ${py.toFixed(1)}`];
+		let px = rng() * size;
+		let py = rng() * size;
+		const pts: string[] = [`M${fmt(px, size)} ${fmt(py, size)}`];
 
 		for (let s = 0; s < STEPS; s++) {
-			const n1 = noise2D(px * scale, py * scale, noiseSeed);
-			const n2 = noise2D(px * scale * 2, py * scale * 2, noiseSeed + 1000);
+			// Scale coordinates back to 800-space for consistent noise
+			const nx = px / sc, ny = py / sc;
+			const n1 = noise2D(nx * noiseScale, ny * noiseScale, noiseSeed);
+			const n2 = noise2D(nx * noiseScale * 2, ny * noiseScale * 2, noiseSeed + 1000);
 			const angle = (n1 + n2 * 0.5) * Math.PI * turbulence;
 			px += Math.cos(angle) * STEP_SIZE;
 			py += Math.sin(angle) * STEP_SIZE;
-			if (px < -10 || px > SIZE + 10 || py < -10 || py > SIZE + 10) break;
-			pts.push(`L${px.toFixed(1)} ${py.toFixed(1)}`);
+			if (px < -10 || px > size + 10 || py < -10 || py > size + 10) break;
+			pts.push(`L${fmt(px, size)} ${fmt(py, size)}`);
 		}
 		if (pts.length < 4) continue;
 
 		const ci = p % colors.length;
-		const width = 1.0 + rng() * 1.5;
-		out += `<path d="${pts.join(' ')}" fill="none" stroke="${colors[ci]}" stroke-width="${width.toFixed(1)}" stroke-opacity="0.7" stroke-linecap="round"/>`;
+		const width = (1.0 + rng() * 1.5) * sc;
+		out += `<path d="${pts.join(' ')}" fill="none" stroke="${colors[ci]}" stroke-width="${fmt(width, size)}" stroke-opacity="0.7" stroke-linecap="round"/>`;
 	}
 
-	return svgWrap('#080810', out);
+	return svgWrap('#080810', out, size);
 }
 
 // ─── 3. Hyperbolic Tessellation ("Infinite Mirror") ────────────────────────
@@ -228,7 +244,7 @@ function geodesicArcSVG(z1: C, z2: C, s: number, o: number): string {
 	return `A${r.toFixed(1)} ${r.toFixed(1)} 0 0 ${sweep} ${x2.toFixed(1)} ${y2.toFixed(1)}`;
 }
 
-export function hyperbolicTessellation(seed: number): string {
+export function hyperbolicTessellation(seed: number, size = DEFAULT_SIZE): string {
 	const rng = mulberry32(seed);
 	const pairs: [number, number][] = [
 		[5, 4],
@@ -243,9 +259,10 @@ export function hyperbolicTessellation(seed: number): string {
 	const [p, q] = pairs[Math.floor(rng() * pairs.length)];
 	const hueBase = rng() * 360;
 	const rotation = rng() * TAU;
-	const MAX_DEPTH = 4;
-	const R = SIZE * 0.45;
-	const O = SIZE / 2;
+	const sc = size / DEFAULT_SIZE;
+	const MAX_DEPTH = sc < 0.25 ? 2 : sc < 0.5 ? 3 : 4;
+	const R = size * 0.45;
+	const O = size / 2;
 
 	// Jewel-tone palette — high saturation, moderate-high lightness
 	const depthColors = Array.from({ length: 6 }, (_, i) => hsl((hueBase + i * 55) % 360, 75 + rng() * 20, 50 + i * 5));
@@ -290,11 +307,11 @@ export function hyperbolicTessellation(seed: number): string {
 	// Draw — outer ring glow + disk background
 	let out = '';
 	out += `<defs><radialGradient id="dg"><stop offset="0%" stop-color="#181830"/><stop offset="85%" stop-color="#0e0e1c"/><stop offset="100%" stop-color="#06060e"/></radialGradient></defs>`;
-	out += `<circle cx="${O}" cy="${O}" r="${R + 2}" fill="url(#dg)" stroke="${hsl(hueBase, 40, 30)}" stroke-width="1.5"/>`;
+	out += `<circle cx="${O}" cy="${O}" r="${R + 2}" fill="url(#dg)" stroke="${hsl(hueBase, 40, 30)}" stroke-width="${fmt(1.5 * sc, size)}"/>`;
 
 	for (const { verts, depth } of polys) {
 		const first = verts[0];
-		let d = `M${(O + first[0] * R).toFixed(1)} ${(O + first[1] * R).toFixed(1)}`;
+		let d = `M${fmt(O + first[0] * R, size)} ${fmt(O + first[1] * R, size)}`;
 		for (let i = 1; i <= verts.length; i++) {
 			const prev = verts[(i - 1) % verts.length];
 			const curr = verts[i % verts.length];
@@ -303,54 +320,58 @@ export function hyperbolicTessellation(seed: number): string {
 		d += 'Z';
 		const fillOpacity = 0.65 - depth * 0.06;
 		const strokeColor = hsl((hueBase + depth * 55 + 20) % 360, 60, 75);
-		out += `<path d="${d}" fill="${depthColors[depth % depthColors.length]}" fill-opacity="${fillOpacity.toFixed(2)}" stroke="${strokeColor}" stroke-width="0.8" stroke-opacity="0.85"/>`;
+		out += `<path d="${d}" fill="${depthColors[depth % depthColors.length]}" fill-opacity="${fillOpacity.toFixed(2)}" stroke="${strokeColor}" stroke-width="${fmt(0.8 * sc, size)}" stroke-opacity="0.85"/>`;
 	}
 
-	return svgWrap('#06060e', out);
+	return svgWrap('#06060e', out, size);
 }
 
 // ─── 4. Moire Interference ("Phase Shift") ─────────────────────────────────
 
-export function moireInterference(seed: number): string {
+export function moireInterference(seed: number, size = DEFAULT_SIZE): string {
 	const rng = mulberry32(seed);
 	const hueBase = rng() * 360;
 	let out = '';
-	const mid = SIZE / 2;
+	const sc = size / DEFAULT_SIZE;
+	const mid = size / 2;
 
 	// Two sets of concentric circles — offset centers create moire fringes
-	const offset = 70 + rng() * 100;
+	const offset = (70 + rng() * 100) * sc;
 	const offsetAngle = rng() * TAU;
 	const centers: [number, number][] = [
 		[mid + Math.cos(offsetAngle) * offset * 0.5, mid + Math.sin(offsetAngle) * offset * 0.5],
 		[mid - Math.cos(offsetAngle) * offset * 0.5, mid - Math.sin(offsetAngle) * offset * 0.5],
 	];
 
-	const spacing = 5 + rng() * 3;
-	const maxR = SIZE * 0.8;
+	// Increase spacing for small sizes to keep ring count reasonable
+	const baseSpacing = 5 + rng() * 3;
+	const spacing = sc < 0.25 ? baseSpacing * 3 : sc < 0.5 ? baseSpacing * 2 : baseSpacing;
+	const maxR = size * 0.8;
 
 	// Use just two circle layers for cleaner interference
 	const hues = [(hueBase) % 360, (hueBase + 180) % 360];
+	const sw = fmt(2.2 * sc, size);
 	for (let layer = 0; layer < 2; layer++) {
 		const [cx, cy] = centers[layer];
 		const rings = Math.floor(maxR / spacing);
 
 		for (let i = 1; i <= rings; i++) {
 			const r = i * spacing;
-			out += `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${r.toFixed(1)}" fill="none" stroke="${hsl(hues[layer], 90, 75)}" stroke-width="2.2" stroke-opacity="0.8"/>`;
+			out += `<circle cx="${fmt(cx, size)}" cy="${fmt(cy, size)}" r="${fmt(r, size)}" fill="none" stroke="${hsl(hues[layer], 90, 75)}" stroke-width="${sw}" stroke-opacity="0.8"/>`;
 		}
 	}
 
-	return svgWrap('#000000', out);
+	return svgWrap('#000000', out, size);
 }
 
 // ─── Registry ───────────────────────────────────────────────────────────────
 
-export const STYLES = {
+export const STYLES: Record<string, { name: string; fn: (seed: number, size?: number) => string; description: string }> = {
 	attractor: { name: 'Strange Attractor', fn: cliffordAttractor, description: 'De Jong strange attractor -- chaotic orbital trajectories' },
 	flow: { name: 'Neural Flow', fn: flowField, description: 'Perlin noise flow field -- organic particle traces' },
 	hyperbolic: { name: 'Infinite Mirror', fn: hyperbolicTessellation, description: 'Poincare disk hyperbolic tessellation -- non-Euclidean geometry' },
 	moire: { name: 'Phase Shift', fn: moireInterference, description: 'Warped moire interference -- optical illusion patterns' },
-} as const;
+};
 
 export type StyleKey = keyof typeof STYLES;
 export const STYLE_KEYS = Object.keys(STYLES) as StyleKey[];

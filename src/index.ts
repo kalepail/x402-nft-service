@@ -3,7 +3,7 @@ import { cors } from 'hono/cors';
 import { Keypair } from '@stellar/stellar-sdk';
 import { x402Middleware, type X402RouteConfig } from './x402';
 import type { ChannelConfig } from './channel';
-import { STYLES, STYLE_KEYS, type StyleKey } from './generators';
+import { STYLES, STYLE_KEYS, type StyleKey, clampSize } from './generators';
 import { svgToPng } from './render';
 
 // Stellar testnet USDC (7 decimals)
@@ -164,6 +164,13 @@ app.get('/openapi.json', (c) => {
 							schema: { type: 'integer' },
 							description: 'Seed for deterministic generation. Omit for a unique timestamp-based seed.',
 						},
+						{
+							name: 'size',
+							in: 'query',
+							required: false,
+							schema: { type: 'integer', minimum: 32, maximum: 800, default: 800 },
+							description: 'Output size in pixels (32-800). Smaller sizes produce fewer SVG elements for faster transfer.',
+						},
 					],
 					responses: {
 						'200': {
@@ -253,7 +260,8 @@ app.get('/preview/:style', async (c) => {
 	if (!STYLES[style]) {
 		return c.json({ error: `Unknown style. Available: ${STYLE_KEYS.join(', ')}` }, 404);
 	}
-	const svg = STYLES[style].fn(0);
+	const size = clampSize(parseInt(c.req.query('size') || '', 10));
+	const svg = STYLES[style].fn(0, size);
 
 	const accept = c.req.header('accept') || '';
 	if (accept.includes('image/svg+xml') || c.req.query('format') === 'svg') {
@@ -273,7 +281,8 @@ app.get('/mint/:style', async (c) => {
 	}
 	const seedParam = c.req.query('seed');
 	const seed = seedParam ? parseInt(seedParam, 10) : Date.now();
-	const svg = STYLES[style].fn(seed);
+	const size = clampSize(parseInt(c.req.query('size') || '', 10));
+	const svg = STYLES[style].fn(seed, size);
 
 	// Return SVG directly if requested (much faster — skips resvg-wasm PNG rendering)
 	const accept = c.req.header('accept') || '';
