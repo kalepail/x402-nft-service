@@ -41,64 +41,77 @@ const KNOWN_GOOD_PARAMS: [number, number, number, number][] = [
 
 export function cliffordAttractor(seed: number): string {
 	const rng = mulberry32(seed);
-	const base = KNOWN_GOOD_PARAMS[Math.floor(rng() * KNOWN_GOOD_PARAMS.length)];
-	const jitter = 0.15;
-	const a = base[0] + (rng() - 0.5) * jitter;
-	const b = base[1] + (rng() - 0.5) * jitter;
-	const c = base[2] + (rng() - 0.5) * jitter;
-	const d = base[3] + (rng() - 0.5) * jitter;
 	const hueBase = rng() * 360;
 	const ITERS = 500_000;
 	const GRID = 400; // density grid resolution
 	const PX = SIZE / GRID; // pixel size
+	const MIN_FILLED_CELLS = 2000; // minimum occupied cells to avoid black images
 
-	// Iterate and accumulate density
-	const density = new Float32Array(GRID * GRID);
-	let x = 0.1,
-		y = 0.1;
-	let minX = Infinity,
-		maxX = -Infinity,
-		minY = Infinity,
-		maxY = -Infinity;
+	// Try parameter sets until we find one that fills enough cells
+	let density: Float32Array;
+	let maxD: number;
+	let attempts = 0;
 
-	// First pass: find bounds
-	for (let i = 0; i < 10000; i++) {
-		const nx = Math.sin(a * y) - Math.cos(b * x);
-		const ny = Math.sin(c * x) - Math.cos(d * y);
-		x = nx;
-		y = ny;
-		if (x < minX) minX = x;
-		if (x > maxX) maxX = x;
-		if (y < minY) minY = y;
-		if (y > maxY) maxY = y;
-	}
-	const rangeX = maxX - minX || 1;
-	const rangeY = maxY - minY || 1;
-	const pad = 0.05;
+	do {
+		const baseIdx = (Math.floor(rng() * KNOWN_GOOD_PARAMS.length) + attempts) % KNOWN_GOOD_PARAMS.length;
+		const base = KNOWN_GOOD_PARAMS[baseIdx];
+		// Reduce jitter on retries to stay closer to known-good params
+		const jitter = attempts === 0 ? 0.15 : 0.02;
+		const a = base[0] + (rng() - 0.5) * jitter;
+		const b = base[1] + (rng() - 0.5) * jitter;
+		const c = base[2] + (rng() - 0.5) * jitter;
+		const d = base[3] + (rng() - 0.5) * jitter;
 
-	// Second pass: accumulate density
-	x = 0.1;
-	y = 0.1;
-	for (let i = 0; i < ITERS; i++) {
-		const nx = Math.sin(a * y) - Math.cos(b * x);
-		const ny = Math.sin(c * x) - Math.cos(d * y);
-		x = nx;
-		y = ny;
-		const gx = Math.floor(((x - minX) / rangeX * (1 - pad * 2) + pad) * GRID);
-		const gy = Math.floor(((y - minY) / rangeY * (1 - pad * 2) + pad) * GRID);
-		if (gx >= 0 && gx < GRID && gy >= 0 && gy < GRID) {
-			density[gy * GRID + gx]++;
+		density = new Float32Array(GRID * GRID);
+		let x = 0.1, y = 0.1;
+		let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+
+		// First pass: find bounds
+		for (let i = 0; i < 10000; i++) {
+			const nx = Math.sin(a * y) - Math.cos(b * x);
+			const ny = Math.sin(c * x) - Math.cos(d * y);
+			x = nx;
+			y = ny;
+			if (x < minX) minX = x;
+			if (x > maxX) maxX = x;
+			if (y < minY) minY = y;
+			if (y > maxY) maxY = y;
 		}
-	}
+		const rangeX = maxX - minX || 1;
+		const rangeY = maxY - minY || 1;
+		const pad = 0.05;
 
-	// Find max for normalization
-	let maxD = 0;
-	for (let i = 0; i < density.length; i++) {
-		if (density[i] > maxD) maxD = density[i];
-	}
+		// Second pass: accumulate density
+		x = 0.1;
+		y = 0.1;
+		for (let i = 0; i < ITERS; i++) {
+			const nx = Math.sin(a * y) - Math.cos(b * x);
+			const ny = Math.sin(c * x) - Math.cos(d * y);
+			x = nx;
+			y = ny;
+			const gx = Math.floor(((x - minX) / rangeX * (1 - pad * 2) + pad) * GRID);
+			const gy = Math.floor(((y - minY) / rangeY * (1 - pad * 2) + pad) * GRID);
+			if (gx >= 0 && gx < GRID && gy >= 0 && gy < GRID) {
+				density[gy * GRID + gx]++;
+			}
+		}
+
+		maxD = 0;
+		for (let i = 0; i < density.length; i++) {
+			if (density[i] > maxD) maxD = density[i];
+		}
+
+		// Count filled cells
+		let filled = 0;
+		for (let i = 0; i < density.length; i++) {
+			if (density[i] > 0) filled++;
+		}
+
+		attempts++;
+		if (filled >= MIN_FILLED_CELLS || attempts >= KNOWN_GOOD_PARAMS.length) break;
+	} while (true);
 
 	// Render: each occupied cell becomes a small colored rect
-	// Color mapped by density: sparse = cool blue/purple, dense = hot pink/white
 	let rects = '';
 	const logMax = Math.log(maxD + 1);
 	for (let gy = 0; gy < GRID; gy++) {
@@ -106,7 +119,6 @@ export function cliffordAttractor(seed: number): string {
 			const d = density[gy * GRID + gx];
 			if (d === 0) continue;
 			const t = Math.log(d + 1) / logMax; // 0..1, log-scaled
-			// Color ramp: dark blue → cyan → green → yellow → hot pink
 			const hue = (hueBase + 260 - t * 260) % 360;
 			const sat = 70 + t * 25;
 			const lit = 15 + t * 65;

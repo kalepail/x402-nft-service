@@ -9,8 +9,8 @@ import { svgToPng } from './render';
 // Stellar testnet USDC (7 decimals)
 const USDC_TESTNET = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA';
 const DEFAULT_FACILITATOR = 'https://x402.org/facilitator';
-const PRICE_AMOUNT = '1000000'; // $0.10 USDC (7 decimals)
-const PRICE_BIGINT = 1_000_000n;
+const PRICE_AMOUNT = '10000'; // $0.001 USDC (7 decimals)
+const PRICE_BIGINT = 10_000n;
 const NETWORK = 'stellar:testnet';
 
 type Bindings = {
