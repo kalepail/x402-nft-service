@@ -247,13 +247,19 @@ app.get('/styles', (c) =>
 	),
 );
 
-// Free preview — lower fidelity PNG (fixed seed, no uniqueness)
+// Free preview — fixed seed, no uniqueness
 app.get('/preview/:style', async (c) => {
 	const style = c.req.param('style') as StyleKey;
 	if (!STYLES[style]) {
 		return c.json({ error: `Unknown style. Available: ${STYLE_KEYS.join(', ')}` }, 404);
 	}
 	const svg = STYLES[style].fn(0);
+
+	const accept = c.req.header('accept') || '';
+	if (accept.includes('image/svg+xml') || c.req.query('format') === 'svg') {
+		return c.body(svg, 200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'public, max-age=86400' });
+	}
+
 	const png = await svgToPng(svg);
 	return c.body(png, 200, { 'Content-Type': 'image/png', 'Cache-Control': 'public, max-age=86400' });
 });
@@ -268,6 +274,13 @@ app.get('/mint/:style', async (c) => {
 	const seedParam = c.req.query('seed');
 	const seed = seedParam ? parseInt(seedParam, 10) : Date.now();
 	const svg = STYLES[style].fn(seed);
+
+	// Return SVG directly if requested (much faster — skips resvg-wasm PNG rendering)
+	const accept = c.req.header('accept') || '';
+	if (accept.includes('image/svg+xml') || c.req.query('format') === 'svg') {
+		return c.body(svg, 200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' });
+	}
+
 	const png = await svgToPng(svg);
 	return c.body(png, 200, { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' });
 });

@@ -42,10 +42,10 @@ const KNOWN_GOOD_PARAMS: [number, number, number, number][] = [
 export function cliffordAttractor(seed: number): string {
 	const rng = mulberry32(seed);
 	const hueBase = rng() * 360;
-	const ITERS = 500_000;
-	const GRID = 400; // density grid resolution
+	const ITERS = 200_000;
+	const GRID = 200; // density grid resolution
 	const PX = SIZE / GRID; // pixel size
-	const MIN_FILLED_CELLS = 2000; // minimum occupied cells to avoid black images
+	const MIN_FILLED_CELLS = 500; // minimum occupied cells to avoid black images
 
 	// Try parameter sets until we find one that fills enough cells
 	let density: Float32Array;
