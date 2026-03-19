@@ -169,8 +169,8 @@ async function handleExactPayment(
 			const headers = new Headers(c.res.headers);
 			headers.set('PAYMENT-RESPONSE', toBase64(JSON.stringify(settlement)));
 			c.res = new Response(c.res.body, { status: c.res.status, statusText: c.res.statusText, headers });
-		} catch {
-			console.error('x402: settlement call failed');
+		} catch (err) {
+			console.error('x402: settlement call failed', err);
 		}
 	}
 }

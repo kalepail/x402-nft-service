@@ -1,6 +1,6 @@
 import { Buffer } from 'node:buffer';
-import { env, SELF, fetchMock } from 'cloudflare:test';
-import { describe, it, expect, beforeAll, afterEach } from 'vitest';
+import { env, SELF } from 'cloudflare:test';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 
 const USDC_TESTNET = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA';
 
@@ -10,15 +10,6 @@ function toBase64(str: string): string {
 function fromBase64(b64: string): string {
 	return Buffer.from(b64, 'base64').toString('utf-8');
 }
-
-beforeAll(() => {
-	fetchMock.activate();
-	fetchMock.disableNetConnect();
-});
-
-afterEach(() => {
-	fetchMock.assertNoPendingInterceptors();
-});
 
 describe('free endpoints', () => {
 	it('GET / returns service info', async () => {
@@ -90,14 +81,16 @@ describe('discovery endpoints', () => {
 			expect(ep.mimeType).toBe('image/png');
 			expect((ep.url as string).startsWith('https://')).toBe(true);
 			const accepts = ep.accepts as Array<Record<string, unknown>>;
-			expect(accepts).toHaveLength(1);
-			expect(accepts[0].scheme).toBe('exact');
-			expect(accepts[0].network).toBe('stellar:testnet');
-			expect(accepts[0].asset).toBe(USDC_TESTNET);
-			expect(accepts[0].amount).toBe('1000000');
-			expect(accepts[0].payTo).toBe(env.STELLAR_PAY_TO);
-			expect(accepts[0].maxTimeoutSeconds).toBe(60);
-			expect((accepts[0].extra as Record<string, unknown>).areFeesSponsored).toBe(true);
+			// exact scheme is always present; channel scheme is present when CHANNEL_SERVER_SECRET is set
+			expect(accepts.length).toBeGreaterThanOrEqual(1);
+			const exact = accepts.find((a) => a.scheme === 'exact')!;
+			expect(exact).toBeDefined();
+			expect(exact.network).toBe('stellar:testnet');
+			expect(exact.asset).toBe(USDC_TESTNET);
+			expect(exact.amount).toBe('10000');
+			expect(exact.payTo).toBe(env.STELLAR_PAY_TO);
+			expect(exact.maxTimeoutSeconds).toBe(60);
+			expect((exact.extra as Record<string, unknown>).areFeesSponsored).toBe(true);
 		}
 	});
 
@@ -131,14 +124,15 @@ describe('x402 payment gate', () => {
 
 		const decoded = JSON.parse(fromBase64(prHeader!));
 		expect(decoded.x402Version).toBe(2);
-		expect(decoded.accepts).toHaveLength(1);
-		expect(decoded.accepts[0].scheme).toBe('exact');
-		expect(decoded.accepts[0].network).toBe('stellar:testnet');
-		expect(decoded.accepts[0].asset).toBe(USDC_TESTNET);
-		expect(decoded.accepts[0].amount).toBe('1000000');
-		expect(decoded.accepts[0].payTo).toBe(env.STELLAR_PAY_TO);
-		expect(decoded.accepts[0].maxTimeoutSeconds).toBe(60);
-		expect(decoded.accepts[0].extra.areFeesSponsored).toBe(true);
+		expect(decoded.accepts.length).toBeGreaterThanOrEqual(1);
+		const exact = decoded.accepts.find((a: Record<string, unknown>) => a.scheme === 'exact');
+		expect(exact).toBeDefined();
+		expect(exact.network).toBe('stellar:testnet');
+		expect(exact.asset).toBe(USDC_TESTNET);
+		expect(exact.amount).toBe('10000');
+		expect(exact.payTo).toBe(env.STELLAR_PAY_TO);
+		expect(exact.maxTimeoutSeconds).toBe(60);
+		expect(exact.extra.areFeesSponsored).toBe(true);
 	});
 
 	it('returns 402 for all gated styles', async () => {
@@ -163,60 +157,83 @@ describe('x402 payment gate', () => {
 	});
 
 	it('returns 402 when facilitator says payment is invalid', async () => {
-		fetchMock
-			.get('https://x402.org')
-			.intercept({ path: '/facilitator/verify', method: 'POST' })
-			.reply(200, { isValid: false, invalidReason: 'expired auth entries' });
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			if (url.includes('/facilitator/verify')) {
+				return new Response(JSON.stringify({ isValid: false, invalidReason: 'expired auth entries' }), {
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			return originalFetch(input, init);
+		};
 
-		const fakePayload = toBase64(
-			JSON.stringify({
-				x402Version: 2,
-				accepted: { scheme: 'exact', network: 'stellar:testnet' },
-				payload: { transaction: 'fakexdr' },
-			}),
-		);
+		try {
+			const fakePayload = toBase64(
+				JSON.stringify({
+					x402Version: 2,
+					accepted: { scheme: 'exact', network: 'stellar:testnet' },
+					payload: { transaction: 'fakexdr' },
+				}),
+			);
 
-		const resp = await SELF.fetch('https://example.com/mint/attractor', {
-			headers: { 'payment-signature': fakePayload },
-		});
-		expect(resp.status).toBe(402);
-		const body = (await resp.json()) as Record<string, unknown>;
-		expect(body.error).toBe('expired auth entries');
+			const resp = await SELF.fetch('https://example.com/mint/attractor', {
+				headers: { 'payment-signature': fakePayload },
+			});
+			expect(resp.status).toBe(402);
+			const body = (await resp.json()) as Record<string, unknown>;
+			expect(body.error).toBe('expired auth entries');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
 	});
 
 	it('returns PNG and settlement header when payment is valid', async () => {
-		const facilitatorMock = fetchMock.get('https://x402.org');
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+			if (url.includes('/facilitator/verify')) {
+				return new Response(JSON.stringify({ isValid: true, payer: 'GBUYER...' }), {
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			if (url.includes('/facilitator/settle')) {
+				return new Response(
+					JSON.stringify({ success: true, transaction: 'abc123def456', network: 'stellar:testnet', payer: 'GBUYER...' }),
+					{ headers: { 'Content-Type': 'application/json' } },
+				);
+			}
+			return originalFetch(input, init);
+		};
 
-		facilitatorMock.intercept({ path: '/facilitator/verify', method: 'POST' }).reply(200, { isValid: true, payer: 'GBUYER...' });
+		try {
+			const fakePayload = toBase64(
+				JSON.stringify({
+					x402Version: 2,
+					accepted: { scheme: 'exact', network: 'stellar:testnet' },
+					payload: { transaction: 'validxdr' },
+				}),
+			);
 
-		facilitatorMock
-			.intercept({ path: '/facilitator/settle', method: 'POST' })
-			.reply(200, { success: true, transaction: 'abc123def456', network: 'stellar:testnet', payer: 'GBUYER...' });
+			const resp = await SELF.fetch('https://example.com/mint/attractor?seed=42', {
+				headers: { 'payment-signature': fakePayload },
+			});
+			expect(resp.status).toBe(200);
+			expect(resp.headers.get('content-type')).toBe('image/png');
 
-		const fakePayload = toBase64(
-			JSON.stringify({
-				x402Version: 2,
-				accepted: { scheme: 'exact', network: 'stellar:testnet' },
-				payload: { transaction: 'validxdr' },
-			}),
-		);
+			const body = new Uint8Array(await resp.arrayBuffer());
+			// PNG magic bytes
+			expect(body[0]).toBe(0x89);
+			expect(body[1]).toBe(0x50);
+			expect(body.length).toBeGreaterThan(1000);
 
-		const resp = await SELF.fetch('https://example.com/mint/attractor?seed=42', {
-			headers: { 'payment-signature': fakePayload },
-		});
-		expect(resp.status).toBe(200);
-		expect(resp.headers.get('content-type')).toBe('image/png');
-
-		const body = new Uint8Array(await resp.arrayBuffer());
-		// PNG magic bytes
-		expect(body[0]).toBe(0x89);
-		expect(body[1]).toBe(0x50);
-		expect(body.length).toBeGreaterThan(1000);
-
-		const prHeader = resp.headers.get('PAYMENT-RESPONSE');
-		expect(prHeader).toBeTruthy();
-		const settlement = JSON.parse(fromBase64(prHeader!));
-		expect(settlement.success).toBe(true);
-		expect(settlement.transaction).toBe('abc123def456');
+			const prHeader = resp.headers.get('PAYMENT-RESPONSE');
+			expect(prHeader).toBeTruthy();
+			const settlement = JSON.parse(fromBase64(prHeader!));
+			expect(settlement.success).toBe(true);
+			expect(settlement.transaction).toBe('abc123def456');
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
 	});
 });

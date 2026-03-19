@@ -191,20 +191,12 @@ type C = [number, number]; // complex number [re, im]
 function cAbs(a: C): number {
 	return Math.sqrt(a[0] * a[0] + a[1] * a[1]);
 }
-function cSub(a: C, b: C): C {
-	return [a[0] - b[0], a[1] - b[1]];
-}
 function cAdd(a: C, b: C): C {
 	return [a[0] + b[0], a[1] + b[1]];
 }
 function cScale(a: C, s: number): C {
 	return [a[0] * s, a[1] * s];
 }
-function cDiv(a: C, b: C): C {
-	const d = b[0] * b[0] + b[1] * b[1];
-	return [(a[0] * b[0] + a[1] * b[1]) / d, (a[1] * b[0] - a[0] * b[1]) / d];
-}
-
 /** Reflect z through the geodesic (Poincare disk) between p1 and p2. */
 function reflectThroughGeodesic(z: C, p1: C, p2: C): C {
 	const cross = p1[0] * p2[1] - p1[1] * p2[0];

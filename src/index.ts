@@ -68,7 +68,7 @@ app.get('/', (c) => {
 		name: 'x402 Generative NFT Service',
 		description: 'Mathematically complex generative art gated by x402 micropayments on Stellar testnet',
 		network: NETWORK,
-		price: '$0.10 USDC',
+		price: '$0.001 USDC',
 		styles: STYLE_KEYS,
 		endpoints: {
 			styles: 'GET /styles',
@@ -93,7 +93,7 @@ app.get('/openapi.json', (c) => {
 			title: 'x402 Generative NFT Service',
 			version: '1.0.0',
 			description:
-				'Generates mathematically complex generative art (strange attractors, flow fields, hyperbolic tessellations, moire patterns) as PNG images. Minting requires an x402 micropayment of $0.10 USDC on Stellar testnet. Previews are free.',
+				'Generates mathematically complex generative art (strange attractors, flow fields, hyperbolic tessellations, moire patterns) as PNG images. Minting requires an x402 micropayment of $0.001 USDC on Stellar testnet. Previews are free.',
 			'x-agent-instructions':
 				'To mint: GET /mint/{style}?seed={number}. The first request returns HTTP 402 with a PAYMENT-REQUIRED header containing base64-encoded JSON payment requirements. Build a Stellar Soroban transfer transaction for the specified USDC amount, sign the auth entries, and retry with a payment-signature header containing the base64-encoded payment payload. Use @x402/fetch or @x402/stellar to handle this automatically.',
 		},
@@ -148,8 +148,8 @@ app.get('/openapi.json', (c) => {
 			'/mint/{style}': {
 				get: {
 					operationId: 'mintNFT',
-					summary: 'Mint a unique generative art PNG (x402 payment required: $0.10 USDC on Stellar testnet)',
-					description: `Requires x402 payment. First request without payment returns 402 with PAYMENT-REQUIRED header. Payment: ${PRICE_AMOUNT} stroops (= $0.10) of USDC (${USDC_TESTNET}) on ${NETWORK} to ${payTo}. Use @x402/fetch to handle payment automatically.`,
+					summary: 'Mint a unique generative art PNG (x402 payment required: $0.001 USDC on Stellar testnet)',
+					description: `Requires x402 payment. First request without payment returns 402 with PAYMENT-REQUIRED header. Payment: ${PRICE_AMOUNT} stroops ($0.001 USDC, 7 decimals) on ${NETWORK} to ${payTo}. Use @x402/fetch to handle payment automatically.`,
 					parameters: [
 						{
 							name: 'style',
