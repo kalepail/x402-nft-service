@@ -3,6 +3,9 @@
 	"name": "x402-nft-service",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-09-27",
+	"routes": [
+		{ "pattern": "x402-nft.stellar.buzz", "custom_domain": true }
+	],
 	"observability": {
 		"enabled": true
 	},
