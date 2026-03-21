@@ -36,6 +36,8 @@ export interface ChannelConfig {
 	serverKeypair: Keypair;
 	/** Price per request in the token's smallest unit. */
 	price: bigint;
+	/** Suggested deposit for stateless demo-compatible channels. */
+	suggestedDeposit?: bigint;
 }
 
 // ── State message ────────────────────────────────────────────────────────────

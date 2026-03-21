@@ -28,6 +28,40 @@ export interface X402RouteConfig {
 	mimeType?: string;
 }
 
+interface X402PaymentPayload {
+	x402Version: number;
+	resource?: Record<string, unknown>;
+	accepted?: {
+		scheme?: string;
+	};
+	payload?: Record<string, unknown>;
+}
+
+export function buildChannelRequirements(
+	config: X402RouteConfig,
+	channelConfig: ChannelConfig,
+): Record<string, unknown> {
+	const suggestedDeposit = String(channelConfig.suggestedDeposit ?? channelConfig.price * 100n);
+	return {
+		scheme: 'channel',
+		network: config.requirements.network,
+		asset: config.requirements.asset,
+		amount: String(channelConfig.price),
+		payTo: config.requirements.payTo,
+		maxTimeoutSeconds: config.requirements.maxTimeoutSeconds,
+		extra: {
+			areFeesSponsored: true,
+			suggestedDeposit,
+			serverPublicKey: channelConfig.serverKeypair.publicKey(),
+			channelMode: 'stateless-demo',
+		},
+		// Legacy demo fields kept for compatibility with existing clients.
+		price: String(channelConfig.price),
+		serverPublicKey: channelConfig.serverKeypair.publicKey(),
+		suggestedDeposit,
+	};
+}
+
 /**
  * x402 middleware supporting both exact and channel payment schemes.
  *
@@ -57,8 +91,6 @@ export function x402Middleware(
 			return send402(c, config, channelConfig);
 		}
 
-		// Detect channel scheme: the header is raw JSON with scheme field
-		// Exact scheme: the header is base64-encoded JSON
 		const channelPayment = tryParseChannelHeader(paymentHeader);
 
 		if (channelPayment && channelConfig) {
@@ -79,7 +111,31 @@ function tryParseChannelHeader(header: string): ChannelPaymentHeader | null {
 			return parsed as ChannelPaymentHeader;
 		}
 	} catch {
-		// Not JSON — likely base64-encoded exact scheme
+		// Not JSON — continue and try x402 payload decoding.
+	}
+
+	try {
+		const decoded = JSON.parse(fromBase64(header)) as X402PaymentPayload;
+		const payload = decoded.payload;
+		if (
+			decoded.accepted?.scheme === 'channel' &&
+			payload &&
+			payload.channelId &&
+			payload.agentSig
+		) {
+			return {
+				scheme: 'channel',
+				channelId: String(payload.channelId),
+				iteration: String(payload.iteration),
+				agentBalance: String(payload.agentBalance),
+				serverBalance: String(payload.serverBalance),
+				deposit: String(payload.deposit ?? '0'),
+				agentPublicKey: String(payload.agentPublicKey),
+				agentSig: String(payload.agentSig),
+			};
+		}
+	} catch {
+		// Not a base64 x402 payload either.
 	}
 	return null;
 }
@@ -107,7 +163,15 @@ async function handleChannelPayment(
 			iteration: header.iteration,
 			serverSig: result.counterSig,
 		};
+		const settlement = {
+			success: true,
+			channelId: header.channelId,
+			currentCumulative: header.serverBalance,
+			remainingBalance: header.agentBalance,
+			iteration: header.iteration,
+		};
 		const headers = new Headers(c.res.headers);
+		headers.set('PAYMENT-RESPONSE', toBase64(JSON.stringify(settlement)));
 		headers.set('X-Payment-Response', JSON.stringify(responseHeader));
 		c.res = new Response(c.res.body, { status: c.res.status, statusText: c.res.statusText, headers });
 	}
@@ -181,13 +245,7 @@ function send402(c: Context, config: X402RouteConfig, channelConfig?: ChannelCon
 	const accepts: unknown[] = [config.requirements];
 
 	if (channelConfig) {
-		accepts.push({
-			scheme: 'channel',
-			price: String(channelConfig.price),
-			network: config.requirements.network,
-			asset: config.requirements.asset,
-			serverPublicKey: channelConfig.serverKeypair.publicKey(),
-		});
+		accepts.push(buildChannelRequirements(config, channelConfig));
 	}
 
 	const paymentRequired = {

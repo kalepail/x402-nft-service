@@ -11,6 +11,27 @@ function fromBase64(b64: string): string {
 	return Buffer.from(b64, 'base64').toString('utf-8');
 }
 
+function makeChannelPaymentSignature(overrides: Record<string, unknown> = {}): string {
+	return toBase64(
+		JSON.stringify({
+			x402Version: 2,
+			accepted: { scheme: 'channel', network: 'stellar:testnet' },
+			payload: {
+				scheme: 'channel',
+				mode: 'stateless-demo',
+				channelId: 'aa'.repeat(32),
+				iteration: '1',
+				agentBalance: '999000',
+				serverBalance: '1000',
+				deposit: '1000000',
+				agentPublicKey: 'GBAZQWDLJRWQ6ZZ6L7K3Z4RJOJ2WQFJJWQ5YAXHNSJZPZ7XIGK7QHCM5',
+				agentSig: '00'.repeat(64),
+				...overrides,
+			},
+		}),
+	);
+}
+
 describe('free endpoints', () => {
 	it('GET / returns service info', async () => {
 		const resp = await SELF.fetch('https://example.com/');
@@ -91,6 +112,16 @@ describe('discovery endpoints', () => {
 			expect(exact.payTo).toBe(env.STELLAR_PAY_TO);
 			expect(exact.maxTimeoutSeconds).toBe(60);
 			expect((exact.extra as Record<string, unknown>).areFeesSponsored).toBe(true);
+			const channel = accepts.find((a) => a.scheme === 'channel');
+			if (channel) {
+				expect(channel.amount).toBe('10000');
+				expect(channel.payTo).toBe(env.STELLAR_PAY_TO);
+				expect(channel.maxTimeoutSeconds).toBe(60);
+				expect((channel.extra as Record<string, unknown>).channelMode).toBe('stateless-demo');
+				expect((channel.extra as Record<string, unknown>).serverPublicKey).toBeTruthy();
+				expect(channel.price).toBe('10000');
+				expect(channel.serverPublicKey).toBeTruthy();
+			}
 		}
 	});
 
@@ -186,6 +217,15 @@ describe('x402 payment gate', () => {
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
+	});
+
+	it('accepts channel payments wrapped in x402 PAYMENT-SIGNATURE payloads', async () => {
+		const resp = await SELF.fetch('https://example.com/mint/attractor', {
+			headers: {
+				'payment-signature': makeChannelPaymentSignature(),
+			},
+		});
+		expect(resp.status).toBe(402);
 	});
 
 	it('returns PNG and settlement header when payment is valid', async () => {

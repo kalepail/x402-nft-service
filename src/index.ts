@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { Keypair } from '@stellar/stellar-sdk';
-import { x402Middleware, type X402RouteConfig } from './x402';
+import { buildChannelRequirements, x402Middleware, type X402RouteConfig } from './x402';
 import type { ChannelConfig } from './channel';
 import { STYLES, STYLE_KEYS, type StyleKey, clampSize } from './generators';
 import { svgToPng } from './render';
@@ -53,6 +53,7 @@ app.use('/mint/*', async (c, next) => {
 		channelConfig = {
 			serverKeypair: Keypair.fromSecret(c.env.CHANNEL_SERVER_SECRET),
 			price: PRICE_BIGINT,
+			suggestedDeposit: PRICE_BIGINT * 100n,
 		};
 	}
 
@@ -217,13 +218,18 @@ app.get('/.well-known/x402.json', (c) => {
 
 	if (c.env.CHANNEL_SERVER_SECRET) {
 		const serverKeypair = Keypair.fromSecret(c.env.CHANNEL_SERVER_SECRET);
-		accepts.push({
-			scheme: 'channel',
-			network: NETWORK,
-			asset: USDC_TESTNET,
-			price: PRICE_AMOUNT,
-			serverPublicKey: serverKeypair.publicKey(),
-		});
+		accepts.push(
+			buildChannelRequirements(
+				{
+					requirements: exactScheme,
+				},
+				{
+					serverKeypair,
+					price: PRICE_BIGINT,
+					suggestedDeposit: PRICE_BIGINT * 100n,
+				},
+			),
+		);
 	}
 
 	return c.json({
