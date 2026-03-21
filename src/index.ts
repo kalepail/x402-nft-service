@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { Keypair } from '@stellar/stellar-sdk';
+import { ChannelStateDurableObject } from './channel-draft';
 import { buildChannelRequirements, x402Middleware, type X402RouteConfig } from './x402';
 import type { ChannelConfig } from './channel';
 import { STYLES, STYLE_KEYS, type StyleKey, clampSize } from './generators';
@@ -18,6 +19,7 @@ type Bindings = {
 	FACILITATOR_URL?: string;
 	/** Server secret key for counter-signing channel states. Set as a Worker secret. */
 	CHANNEL_SERVER_SECRET?: string;
+	CHANNEL_STATE: DurableObjectNamespace;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -57,7 +59,7 @@ app.use('/mint/*', async (c, next) => {
 		};
 	}
 
-	const mw = x402Middleware(facilitatorUrl, routeConfigs, channelConfig);
+	const mw = x402Middleware(facilitatorUrl, routeConfigs, channelConfig, c.env.CHANNEL_STATE);
 	return mw(c, next);
 });
 
@@ -96,7 +98,7 @@ app.get('/openapi.json', (c) => {
 			description:
 				'Generates mathematically complex generative art (strange attractors, flow fields, hyperbolic tessellations, moire patterns) as PNG images. Minting requires an x402 micropayment of $0.001 USDC on Stellar testnet. Previews are free.',
 			'x-agent-instructions':
-				'To mint: GET /mint/{style}?seed={number}. The first request returns HTTP 402 with a PAYMENT-REQUIRED header containing base64-encoded JSON payment requirements. Build a Stellar Soroban transfer transaction for the specified USDC amount, sign the auth entries, and retry with a payment-signature header containing the base64-encoded payment payload. Use @x402/fetch or @x402/stellar to handle this automatically.',
+				'To mint: GET /mint/{style}?seed={number}. The first request returns HTTP 402 with a PAYMENT-REQUIRED header. For exact, build a Stellar Soroban transfer transaction and retry with a payment-signature header. Experimental channel support is also advertised: send a channel open payload first, then reuse the returned channelId with pay commitments on later requests. Legacy stateless demo channel headers remain accepted for compatibility.',
 		},
 		servers: [{ url: baseUrl }],
 		paths: {
@@ -150,7 +152,7 @@ app.get('/openapi.json', (c) => {
 				get: {
 					operationId: 'mintNFT',
 					summary: 'Mint a unique generative art PNG (x402 payment required: $0.001 USDC on Stellar testnet)',
-					description: `Requires x402 payment. First request without payment returns 402 with PAYMENT-REQUIRED header. Payment: ${PRICE_AMOUNT} stroops ($0.001 USDC, 7 decimals) on ${NETWORK} to ${payTo}. Use @x402/fetch to handle payment automatically.`,
+						description: `Requires x402 payment. First request without payment returns 402 with PAYMENT-REQUIRED header. Payment: ${PRICE_AMOUNT} stroops ($0.001 USDC, 7 decimals) on ${NETWORK} to ${payTo}. Exact and experimental channel schemes are advertised together when channel support is enabled.`,
 					parameters: [
 						{
 							name: 'style',
@@ -301,3 +303,4 @@ app.get('/mint/:style', async (c) => {
 });
 
 export default app;
+export { ChannelStateDurableObject };

@@ -1,8 +1,20 @@
 import { Buffer } from 'node:buffer';
+import {
+	Account,
+	Address,
+	Contract,
+	Keypair,
+	Networks,
+	TransactionBuilder,
+	hash,
+	nativeToScVal,
+	xdr,
+} from '@stellar/stellar-sdk';
 import { env, SELF } from 'cloudflare:test';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
 const USDC_TESTNET = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA';
+const TESTNET_PASSPHRASE = Networks.TESTNET;
 
 function toBase64(str: string): string {
 	return Buffer.from(str, 'utf-8').toString('base64');
@@ -11,7 +23,37 @@ function fromBase64(b64: string): string {
 	return Buffer.from(b64, 'base64').toString('utf-8');
 }
 
-function makeChannelPaymentSignature(overrides: Record<string, unknown> = {}): string {
+function writeBigInt128BE(buf: Buffer, value: bigint, offset: number): void {
+	const mask64 = (1n << 64n) - 1n;
+	const hi = (value >> 64n) & mask64;
+	const lo = value & mask64;
+	buf.writeBigUInt64BE(hi, offset);
+	buf.writeBigUInt64BE(lo, offset + 8);
+}
+
+function signDemoState(
+	keypair: Keypair,
+	channelId: string,
+	iteration: bigint,
+	agentBalance: bigint,
+	serverBalance: bigint,
+): string {
+	const channelIdBytes = Buffer.from(channelId, 'hex');
+	const buf = Buffer.alloc(72);
+	channelIdBytes.copy(buf, 0);
+	buf.writeBigUInt64BE(iteration, 32);
+	writeBigInt128BE(buf, agentBalance, 40);
+	writeBigInt128BE(buf, serverBalance, 56);
+	return Buffer.from(keypair.sign(buf)).toString('hex');
+}
+
+function makeDemoChannelPaymentSignature(): string {
+	const agent = Keypair.random();
+	const channelId = 'aa'.repeat(32);
+	const iteration = 1n;
+	const agentBalance = 990000n;
+	const serverBalance = 10000n;
+	const deposit = 1000000n;
 	return toBase64(
 		JSON.stringify({
 			x402Version: 2,
@@ -19,14 +61,114 @@ function makeChannelPaymentSignature(overrides: Record<string, unknown> = {}): s
 			payload: {
 				scheme: 'channel',
 				mode: 'stateless-demo',
-				channelId: 'aa'.repeat(32),
-				iteration: '1',
-				agentBalance: '999000',
-				serverBalance: '1000',
-				deposit: '1000000',
-				agentPublicKey: 'GBAZQWDLJRWQ6ZZ6L7K3Z4RJOJ2WQFJJWQ5YAXHNSJZPZ7XIGK7QHCM5',
-				agentSig: '00'.repeat(64),
-				...overrides,
+				channelId,
+				iteration: iteration.toString(),
+				agentBalance: agentBalance.toString(),
+				serverBalance: serverBalance.toString(),
+				deposit: deposit.toString(),
+				agentPublicKey: agent.publicKey(),
+				agentSig: signDemoState(agent, channelId, iteration, agentBalance, serverBalance),
+			},
+		}),
+	);
+}
+
+function buildDraftCommitmentBytes(channelId: string, amount: bigint): Buffer {
+	const entries = [
+		new xdr.ScMapEntry({
+			key: xdr.ScVal.scvSymbol('amount'),
+			val: nativeToScVal(amount, { type: 'i128' }),
+		}),
+		new xdr.ScMapEntry({
+			key: xdr.ScVal.scvSymbol('channel'),
+			val: new Address(channelId).toScVal(),
+		}),
+		new xdr.ScMapEntry({
+			key: xdr.ScVal.scvSymbol('domain'),
+			val: xdr.ScVal.scvSymbol('chancmmt'),
+		}),
+		new xdr.ScMapEntry({
+			key: xdr.ScVal.scvSymbol('network'),
+			val: xdr.ScVal.scvBytes(hash(Buffer.from(TESTNET_PASSPHRASE))),
+		}),
+	];
+	return Buffer.from(xdr.ScVal.scvMap(entries).toXDR());
+}
+
+function buildDraftOpenTransaction(
+	factoryContract: string,
+	asset: string,
+	payTo: string,
+	payer: Keypair,
+	commitment: Keypair,
+	deposit: bigint,
+): string {
+	const account = new Account(payer.publicKey(), '1');
+	return new TransactionBuilder(account, {
+		fee: '100',
+		networkPassphrase: TESTNET_PASSPHRASE,
+	})
+		.addOperation(
+			new Contract(factoryContract).call(
+				'open',
+				nativeToScVal(Buffer.alloc(32, 7)),
+				new Address(asset).toScVal(),
+				new Address(payer.publicKey()).toScVal(),
+				nativeToScVal(Buffer.from(commitment.rawPublicKey())),
+				new Address(payTo).toScVal(),
+				nativeToScVal(deposit, { type: 'i128' }),
+				nativeToScVal(24, { type: 'u32' }),
+			),
+		)
+		.setTimeout(30)
+		.build()
+		.toEnvelope()
+		.toXDR('base64');
+}
+
+function makeDraftOpenPaymentSignature(
+	channelAccept: Record<string, unknown>,
+	deposit: bigint,
+	payer: Keypair,
+	commitment: Keypair,
+): string {
+	return toBase64(
+		JSON.stringify({
+			x402Version: 2,
+			accepted: channelAccept,
+			payload: {
+				action: 'open',
+				transaction: buildDraftOpenTransaction(
+					channelAccept.extra.factoryContract as string,
+					channelAccept.asset as string,
+					channelAccept.payTo as string,
+					payer,
+					commitment,
+					deposit,
+				),
+				commitmentKey: commitment.publicKey(),
+			},
+		}),
+	);
+}
+
+function makeDraftPayPaymentSignature(
+	channelAccept: Record<string, unknown>,
+	channelId: string,
+	commitment: Keypair,
+	cumulativeAmount: bigint,
+): string {
+	return toBase64(
+		JSON.stringify({
+			x402Version: 2,
+			accepted: channelAccept,
+			payload: {
+				action: 'pay',
+				channelId,
+				cumulativeAmount: cumulativeAmount.toString(),
+				signature: Buffer.from(
+					commitment.sign(buildDraftCommitmentBytes(channelId, cumulativeAmount)),
+				).toString('base64'),
 			},
 		}),
 	);
@@ -117,7 +259,9 @@ describe('discovery endpoints', () => {
 				expect(channel.amount).toBe('10000');
 				expect(channel.payTo).toBe(env.STELLAR_PAY_TO);
 				expect(channel.maxTimeoutSeconds).toBe(60);
-				expect((channel.extra as Record<string, unknown>).channelMode).toBe('stateless-demo');
+				expect((channel.extra as Record<string, unknown>).channelMode).toBe('hybrid-experimental');
+				expect((channel.extra as Record<string, unknown>).factoryContract).toBeTruthy();
+				expect((channel.extra as Record<string, unknown>).refundWaitingPeriod).toBe(24);
 				expect((channel.extra as Record<string, unknown>).serverPublicKey).toBeTruthy();
 				expect(channel.price).toBe('10000');
 				expect(channel.serverPublicKey).toBeTruthy();
@@ -219,13 +363,57 @@ describe('x402 payment gate', () => {
 		}
 	});
 
-	it('accepts channel payments wrapped in x402 PAYMENT-SIGNATURE payloads', async () => {
+	it('accepts valid stateless demo channel payments wrapped in x402 PAYMENT-SIGNATURE payloads', async () => {
 		const resp = await SELF.fetch('https://example.com/mint/attractor', {
 			headers: {
-				'payment-signature': makeChannelPaymentSignature(),
+				'payment-signature': makeDemoChannelPaymentSignature(),
 			},
 		});
-		expect(resp.status).toBe(402);
+		expect(resp.status).toBe(200);
+		expect(resp.headers.get('PAYMENT-RESPONSE')).toBeTruthy();
+	});
+
+	it('opens an experimental draft channel and then accepts a pay action', async () => {
+		const discoveryResp = await SELF.fetch('https://example.com/.well-known/x402.json');
+		const discovery = (await discoveryResp.json()) as Record<string, unknown>;
+		const endpoint = (discovery.endpoints as Array<Record<string, unknown>>).find(
+			(item) => item.path === '/mint/attractor',
+		)!;
+		const channelAccept = (endpoint.accepts as Array<Record<string, unknown>>).find(
+			(item) => item.scheme === 'channel',
+		)!;
+
+		const payer = Keypair.random();
+		const commitment = Keypair.random();
+		const deposit = 1000000n;
+
+		const openResp = await SELF.fetch('https://example.com/mint/attractor', {
+			headers: {
+				'payment-signature': makeDraftOpenPaymentSignature(channelAccept, deposit, payer, commitment),
+			},
+		});
+		expect(openResp.status).toBe(200);
+		const openBody = (await openResp.json()) as Record<string, unknown>;
+		expect(openBody.success).toBe(true);
+		expect(openBody.resourceGranted).toBe(false);
+		expect(typeof openBody.channelId).toBe('string');
+
+		const payResp = await SELF.fetch('https://example.com/mint/attractor?seed=7', {
+			headers: {
+				'payment-signature': makeDraftPayPaymentSignature(
+					channelAccept,
+					String(openBody.channelId),
+					commitment,
+					10000n,
+				),
+			},
+		});
+		expect(payResp.status).toBe(200);
+		expect(payResp.headers.get('content-type')).toBe('image/png');
+		const settlement = JSON.parse(fromBase64(payResp.headers.get('PAYMENT-RESPONSE')!));
+		expect(settlement.channelId).toBe(openBody.channelId);
+		expect(settlement.currentCumulative).toBe('10000');
+		expect(settlement.remainingBalance).toBe('990000');
 	});
 
 	it('returns PNG and settlement header when payment is valid', async () => {

@@ -13,6 +13,20 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "CHANNEL_STATE",
+				"class_name": "ChannelStateDurableObject"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_classes": ["ChannelStateDurableObject"]
+		}
+	],
 	"vars": {
 		"STELLAR_PAY_TO": "GBY77G2AKKMYAW4IVYILYYH5XCPSUL2ERKNQDV4E6QZLYEOUFRCX76IM",
 		"FACILITATOR_URL": "https://x402.org/facilitator"
