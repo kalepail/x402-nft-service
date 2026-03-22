@@ -1,46 +1,54 @@
-/**
- * Channel payment verification for x402.
- *
- * Enables stateless verification of off-chain payment channel states.
- * Each state is self-describing — no server-side storage needed.
- *
- * The canonical 72-byte state message matches the on-chain Soroban contract:
- *   channel_id (32 BE) || iteration (8 BE) || agent_balance (16 BE) || server_balance (16 BE)
- */
-
 import { Buffer } from 'node:buffer';
-import { Keypair } from '@stellar/stellar-sdk';
-
-// ── Types ────────────────────────────────────────────────────────────────────
+import { createHash } from 'node:crypto';
+import { Keypair, StrKey } from '@stellar/stellar-sdk';
 
 export interface ChannelPaymentHeader {
 	scheme: 'channel';
-	channelId: string; // hex 32 bytes
-	iteration: string; // bigint as decimal string
+	channelId: string;
+	iteration: string;
 	agentBalance: string;
 	serverBalance: string;
-	deposit: string;
-	agentPublicKey: string; // G... Stellar strkey
-	agentSig: string; // hex 64-byte ed25519 signature
+	deposit?: string;
+	agentPublicKey?: string;
+	agentSig: string;
 }
 
 export interface ChannelPaymentResponse {
 	scheme: 'channel';
 	channelId: string;
 	iteration: string;
-	serverSig: string; // hex 64-byte ed25519 counter-signature
+	serverSig: string;
 }
 
 export interface ChannelConfig {
-	/** Server keypair for counter-signing channel states. */
 	serverKeypair: Keypair;
-	/** Price per request in the token's smallest unit. */
+	facilitatorKeypair: Keypair;
 	price: bigint;
-	/** Suggested deposit for stateless demo-compatible channels. */
+	channelContractId: string;
+	networkPassphrase: string;
+	rpcUrl: string;
 	suggestedDeposit?: bigint;
 }
 
-// ── State message ────────────────────────────────────────────────────────────
+export interface ChannelStateSnapshot {
+	channelId: string;
+	iteration: string;
+	agentBalance: string;
+	serverBalance: string;
+	deposit: string;
+	agentPublicKey: string;
+	agentSig: string;
+	serverSig: string;
+}
+
+export interface StoredChannelRecord extends ChannelStateSnapshot {
+	payer: string;
+	payTo: string;
+	asset: string;
+	openedTxHash: string;
+	closedTxHash?: string;
+	status: 'open' | 'closed';
+}
 
 function writeBigInt128BE(buf: Buffer, value: bigint, offset: number): void {
 	const mask64 = (1n << 64n) - 1n;
@@ -50,7 +58,7 @@ function writeBigInt128BE(buf: Buffer, value: bigint, offset: number): void {
 	buf.writeBigUInt64BE(lo, offset + 8);
 }
 
-function stateMessage(
+export function stateMessage(
 	channelId: Buffer,
 	iteration: bigint,
 	agentBalance: bigint,
@@ -64,62 +72,134 @@ function stateMessage(
 	return buf;
 }
 
-// ── Verify + Counter-sign ────────────────────────────────────────────────────
-
-export interface VerifyResult {
-	valid: boolean;
-	error?: string;
-	counterSig?: string; // hex
+export function closeIntentMessage(channelId: string): Buffer {
+	return Buffer.concat([Buffer.from(channelId, 'hex'), Buffer.from('close', 'utf8')]);
 }
 
-/**
- * Verify a channel payment header and produce a counter-signature.
- *
- * Fully stateless — validates the payment math and ed25519 signature
- * without any server-side state. Replay of the same iteration is
- * harmless (agent gets the same resource twice; server's balance only
- * grows with higher iterations).
- */
-export function verifyChannelPayment(
+export function signStateHex(
+	keypair: Keypair,
+	channelId: string,
+	iteration: bigint,
+	agentBalance: bigint,
+	serverBalance: bigint,
+): string {
+	const msg = stateMessage(Buffer.from(channelId, 'hex'), iteration, agentBalance, serverBalance);
+	return Buffer.from(keypair.sign(msg)).toString('hex');
+}
+
+export function signCloseIntentHex(keypair: Keypair, channelId: string): string {
+	return Buffer.from(keypair.sign(closeIntentMessage(channelId))).toString('hex');
+}
+
+export function verifyStateSignature(
+	publicKeyStrkey: string,
+	signatureHex: string,
+	channelId: string,
+	iteration: bigint,
+	agentBalance: bigint,
+	serverBalance: bigint,
+): boolean {
+	const msg = stateMessage(Buffer.from(channelId, 'hex'), iteration, agentBalance, serverBalance);
+	const keypair = Keypair.fromPublicKey(publicKeyStrkey);
+	return keypair.verify(msg, Buffer.from(signatureHex, 'hex'));
+}
+
+export function verifyCloseIntentSignature(
+	publicKeyStrkey: string,
+	signatureHex: string,
+	channelId: string,
+): boolean {
+	const keypair = Keypair.fromPublicKey(publicKeyStrkey);
+	return keypair.verify(closeIntentMessage(channelId), Buffer.from(signatureHex, 'hex'));
+}
+
+export function deriveChannelIdHex(agentPublicKey: string, nonce: Uint8Array): string {
+	return createHash('sha256')
+		.update(Buffer.from(StrKey.decodeEd25519PublicKey(agentPublicKey)))
+		.update(Buffer.from(nonce))
+		.digest('hex');
+}
+
+export interface VerifiedChannelPayment {
+	iteration: bigint;
+	agentBalance: bigint;
+	serverBalance: bigint;
+	deposit: bigint;
+	currentCumulative: bigint;
+	remainingBalance: bigint;
+	counterSig: string;
+}
+
+export function verifyStateChannelPayment(
 	header: ChannelPaymentHeader,
+	record: StoredChannelRecord,
 	config: ChannelConfig,
-): VerifyResult {
+): { ok: true; payment: VerifiedChannelPayment } | { ok: false; error: string } {
 	const iteration = BigInt(header.iteration);
 	const agentBalance = BigInt(header.agentBalance);
 	const serverBalance = BigInt(header.serverBalance);
-	const deposit = BigInt(header.deposit);
+	const deposit = BigInt(record.deposit);
+	const previousIteration = BigInt(record.iteration);
+	const previousServerBalance = BigInt(record.serverBalance);
 
-	// 1. Conservation: balances must sum to deposit
+	if (record.status !== 'open') {
+		return { ok: false, error: 'channel/finalized' };
+	}
+	if (header.channelId !== record.channelId) {
+		return { ok: false, error: 'channel/not-found' };
+	}
+	if (header.agentPublicKey && header.agentPublicKey !== record.agentPublicKey) {
+		return { ok: false, error: 'channel/agent-key-mismatch' };
+	}
 	if (agentBalance + serverBalance !== deposit) {
-		return { valid: false, error: 'Balances do not sum to deposit' };
+		return { ok: false, error: 'channel/bad-balances' };
 	}
-
-	// 2. Non-negative balances
 	if (agentBalance < 0n || serverBalance < 0n) {
-		return { valid: false, error: 'Negative balance' };
+		return { ok: false, error: 'channel/bad-balances' };
 	}
-
-	// 3. Payment amount: server must have received at least iteration × price
-	if (serverBalance < iteration * config.price) {
-		return { valid: false, error: 'Insufficient payment for iteration count' };
+	if (iteration !== previousIteration + 1n) {
+		return { ok: false, error: 'channel/bad-iteration' };
 	}
-
-	// 4. Verify ed25519 signature
-	const channelIdBuf = Buffer.from(header.channelId, 'hex');
-	const agentSig = Buffer.from(header.agentSig, 'hex');
-	const msg = stateMessage(channelIdBuf, iteration, agentBalance, serverBalance);
-
+	if (serverBalance - previousServerBalance !== config.price) {
+		return { ok: false, error: 'channel/amount-mismatch' };
+	}
+	if (serverBalance > deposit) {
+		return { ok: false, error: 'channel/insufficient-balance' };
+	}
 	try {
-		const agentKp = Keypair.fromPublicKey(header.agentPublicKey);
-		if (!agentKp.verify(msg, agentSig)) {
-			return { valid: false, error: 'Invalid agent signature' };
+		if (
+			!verifyStateSignature(
+				record.agentPublicKey,
+				header.agentSig,
+				record.channelId,
+				iteration,
+				agentBalance,
+				serverBalance,
+			)
+		) {
+			return { ok: false, error: 'channel/invalid-signature' };
 		}
 	} catch {
-		return { valid: false, error: 'Invalid agent public key or signature format' };
+		return { ok: false, error: 'channel/invalid-signature' };
 	}
 
-	// 5. Counter-sign the state
-	const counterSig = Buffer.from(config.serverKeypair.sign(msg)).toString('hex');
-
-	return { valid: true, counterSig };
+	const counterSig = signStateHex(
+		config.serverKeypair,
+		record.channelId,
+		iteration,
+		agentBalance,
+		serverBalance,
+	);
+	return {
+		ok: true,
+		payment: {
+			iteration,
+			agentBalance,
+			serverBalance,
+			deposit,
+			currentCumulative: serverBalance,
+			remainingBalance: agentBalance,
+			counterSig,
+		},
+	};
 }

@@ -1,17 +1,21 @@
 import { Buffer } from 'node:buffer';
 import type { Context, MiddlewareHandler, Next } from 'hono';
 import {
-	DRAFT_CHANNEL_FACTORY_CONTRACT,
-	DRAFT_REFUND_WAITING_PERIOD,
-	networkPassphraseForNetwork,
-	parseDraftOpenTransaction,
-} from './channel-draft';
-import {
-	verifyChannelPayment,
 	type ChannelConfig,
 	type ChannelPaymentHeader,
 	type ChannelPaymentResponse,
+	type StoredChannelRecord,
+	signStateHex,
+	verifyCloseIntentSignature,
+	verifyStateChannelPayment,
+	verifyStateSignature,
 } from './channel';
+import {
+	networkPassphraseForNetwork,
+	parseOpenChannelTransaction,
+	relayOpenChannelTransaction,
+	submitCloseChannelTransaction,
+} from './channel-chain';
 
 const X402_VERSION = 2;
 
@@ -48,7 +52,7 @@ interface X402PaymentPayload {
 
 type ParsedChannelPayment =
 	| { kind: 'demo'; header: ChannelPaymentHeader }
-	| { kind: 'draft'; payload: X402PaymentPayload; action: 'open' | 'pay' };
+	| { kind: 'state'; payload: X402PaymentPayload; action: 'open' | 'pay' | 'close' };
 
 function paymentResponseHeaders(settlement: Record<string, unknown>): Headers {
 	return new Headers({
@@ -98,14 +102,15 @@ export function buildChannelRequirements(
 		extra: {
 			areFeesSponsored: true,
 			suggestedDeposit,
-			factoryContract: DRAFT_CHANNEL_FACTORY_CONTRACT,
-			refundWaitingPeriod: DRAFT_REFUND_WAITING_PERIOD,
+			channelContract: channelConfig.channelContractId,
 			serverPublicKey: channelConfig.serverKeypair.publicKey(),
-			channelMode: 'hybrid-experimental',
+			channelMode: 'stellar-state-channel-v1',
+			supportsClose: true,
+			supportsTopUp: false,
 		},
-		// Legacy demo fields kept for compatibility with existing clients.
 		price: String(channelConfig.price),
 		serverPublicKey: channelConfig.serverKeypair.publicKey(),
+		channelContract: channelConfig.channelContractId,
 		suggestedDeposit,
 	};
 }
@@ -136,7 +141,7 @@ export function x402Middleware(
 				return handleDemoChannelPayment(c, next, channelPayment.header, channelConfig);
 			}
 			if (channelState) {
-				return handleDraftChannelPayment(c, next, channelPayment, config, channelState);
+				return handleStateChannelPayment(c, next, channelPayment, config, channelConfig, channelState);
 			}
 		}
 
@@ -161,8 +166,8 @@ function tryParseChannelPayment(header: string): ParsedChannelPayment | null {
 			return null;
 		}
 
-		if (payload.action === 'open' || payload.action === 'pay') {
-			return { kind: 'draft', payload: decoded, action: payload.action };
+		if (payload.action === 'open' || payload.action === 'pay' || payload.action === 'close') {
+			return { kind: 'state', payload: decoded, action: payload.action };
 		}
 
 		if (payload.channelId && payload.agentSig) {
@@ -174,8 +179,9 @@ function tryParseChannelPayment(header: string): ParsedChannelPayment | null {
 					iteration: String(payload.iteration),
 					agentBalance: String(payload.agentBalance),
 					serverBalance: String(payload.serverBalance),
-					deposit: String(payload.deposit ?? '0'),
-					agentPublicKey: String(payload.agentPublicKey),
+					deposit: payload.deposit === undefined ? undefined : String(payload.deposit),
+					agentPublicKey:
+						payload.agentPublicKey === undefined ? undefined : String(payload.agentPublicKey),
 					agentSig: String(payload.agentSig),
 				},
 			};
@@ -187,120 +193,313 @@ function tryParseChannelPayment(header: string): ParsedChannelPayment | null {
 	return null;
 }
 
-async function handleDraftChannelPayment(
+async function getStoredChannel(
+	channelState: DurableObjectNamespace,
+	channelId: string,
+): Promise<StoredChannelRecord | null> {
+	const stub = channelState.get(channelState.idFromName(channelId));
+	const response = await stub.fetch('https://channel/state');
+	if (response.status === 404) return null;
+	if (!response.ok) {
+		throw new Error(`channel state lookup failed: ${await response.text()}`);
+	}
+	return (await response.json()) as StoredChannelRecord;
+}
+
+async function putStoredChannel(
+	channelState: DurableObjectNamespace,
+	channelId: string,
+	endpoint: 'open' | 'pay' | 'close',
+	record: StoredChannelRecord,
+): Promise<void> {
+	const stub = channelState.get(channelState.idFromName(channelId));
+	const response = await stub.fetch(`https://channel/${endpoint}`, {
+		method: 'POST',
+		body: JSON.stringify(record),
+	});
+	if (!response.ok) {
+		throw new Error(`channel state update failed: ${await response.text()}`);
+	}
+}
+
+function mapChannelErrorStatus(error: string): number {
+	switch (error) {
+		case 'channel/not-found':
+			return 404;
+		case 'channel/finalized':
+			return 410;
+		default:
+			return 402;
+	}
+}
+
+async function handleStateChannelPayment(
 	c: Context,
 	next: Next,
-	payment: Extract<ParsedChannelPayment, { kind: 'draft' }>,
+	payment: Extract<ParsedChannelPayment, { kind: 'state' }>,
 	config: X402RouteConfig,
+	channelConfig: ChannelConfig,
 	channelState: DurableObjectNamespace,
 ): Promise<Response | void> {
 	const accepted = normalizeAcceptedRequirement(payment.payload.accepted, config.requirements);
 	assertAcceptedMatchesRoute(accepted, config.requirements);
 
 	if (payment.action === 'open') {
-		return handleDraftOpen(c, payment.payload, accepted, channelState);
+		return handleStateChannelOpen(c, payment.payload, accepted, channelConfig, channelState);
 	}
-
 	if (payment.action === 'pay') {
-		return handleDraftPay(c, next, payment.payload, accepted, channelState);
+		return handleStateChannelPay(c, next, payment.payload, accepted, channelConfig, channelState);
+	}
+	if (payment.action === 'close') {
+		return handleStateChannelClose(c, payment.payload, accepted, channelConfig, channelState);
 	}
 
 	return c.json({ error: 'Unsupported channel action' }, 400);
 }
 
-async function handleDraftOpen(
+async function handleStateChannelOpen(
 	c: Context,
 	payload: X402PaymentPayload,
 	accepted: PaymentRequirements,
+	channelConfig: ChannelConfig,
 	channelState: DurableObjectNamespace,
 ): Promise<Response> {
 	const transaction = payload.payload?.transaction;
-	const commitmentKey = payload.payload?.commitmentKey;
-	if (typeof transaction !== 'string' || typeof commitmentKey !== 'string') {
-		return c.json({ error: 'channel/open requires transaction and commitmentKey' }, 400);
+	const initialStateSignature = payload.payload?.initialStateSignature;
+	if (typeof transaction !== 'string' || typeof initialStateSignature !== 'string') {
+		return c.json({ error: 'channel/open requires transaction and initialStateSignature' }, 400);
 	}
 
 	const networkPassphrase = networkPassphraseForNetwork(accepted.network);
 	let parsed;
 	try {
-		parsed = parseDraftOpenTransaction(transaction, networkPassphrase);
+		parsed = parseOpenChannelTransaction(transaction, networkPassphrase);
 	} catch (error) {
 		return c.json({ error: error instanceof Error ? error.message : String(error) }, 400);
 	}
 
-	if (parsed.factoryContract !== DRAFT_CHANNEL_FACTORY_CONTRACT) {
-		return c.json({ error: 'channel/open factoryContract mismatch' }, 402);
+	if (parsed.channelContractId !== channelConfig.channelContractId) {
+		return c.json({ error: 'channel/open contract mismatch' }, 402);
 	}
 	if (parsed.asset !== accepted.asset || parsed.payTo !== accepted.payTo) {
 		return c.json({ error: 'channel/open transaction args mismatch challenge' }, 402);
 	}
-	if (parsed.commitmentKey !== commitmentKey) {
-		return c.json({ error: 'channel/open commitmentKey mismatch' }, 402);
+	if (parsed.serverPublicKey !== channelConfig.serverKeypair.publicKey()) {
+		return c.json({ error: 'channel/open server key mismatch' }, 402);
+	}
+	if (
+		!verifyStateSignature(
+			parsed.agentPublicKey,
+			initialStateSignature,
+			parsed.channelId,
+			0n,
+			BigInt(parsed.deposit),
+			0n,
+		)
+	) {
+		return c.json({ error: 'channel/open invalid initial state signature' }, 402);
 	}
 
-	const stub = channelState.get(channelState.idFromName(parsed.channelId));
-	const response = await stub.fetch('https://channel/open', {
-		method: 'POST',
-		body: JSON.stringify({
-			channelId: parsed.channelId,
-			asset: parsed.asset,
-			payTo: parsed.payTo,
-			payer: parsed.payer,
-			commitmentKey: parsed.commitmentKey,
-			deposit: parsed.deposit,
-			refundWaitingPeriod: parsed.refundWaitingPeriod,
-		}),
-	});
-	const settlement = (await response.json()) as Record<string, unknown>;
+	const existing = await getStoredChannel(channelState, parsed.channelId);
+	if (existing?.status === 'open') {
+		return c.json(
+			{
+				success: false,
+				error: 'channel/already-exists',
+				channelId: existing.channelId,
+				currentCumulative: existing.serverBalance,
+				remainingBalance: existing.agentBalance,
+			},
+			409,
+		);
+	}
+
+	let transactionHash: string;
+	try {
+		transactionHash = await relayOpenChannelTransaction(channelConfig, transaction);
+	} catch (error) {
+		return c.json({ error: error instanceof Error ? error.message : String(error) }, 502);
+	}
+
+	const serverSig = signStateHex(
+		channelConfig.serverKeypair,
+		parsed.channelId,
+		0n,
+		BigInt(parsed.deposit),
+		0n,
+	);
+	const record: StoredChannelRecord = {
+		channelId: parsed.channelId,
+		payer: parsed.payer,
+		payTo: parsed.payTo,
+		asset: parsed.asset,
+		deposit: parsed.deposit,
+		agentPublicKey: parsed.agentPublicKey,
+		iteration: '0',
+		agentBalance: parsed.deposit,
+		serverBalance: '0',
+		agentSig: initialStateSignature,
+		serverSig,
+		openedTxHash: transactionHash,
+		status: 'open',
+	};
+	await putStoredChannel(channelState, parsed.channelId, 'open', record);
+
+	const settlement = {
+		success: true,
+		transaction: transactionHash,
+		network: accepted.network,
+		payer: parsed.payer,
+		channelId: parsed.channelId,
+		deposit: parsed.deposit,
+		iteration: '0',
+		currentCumulative: '0',
+		remainingBalance: parsed.deposit,
+		serverSig,
+		resourceGranted: false,
+	};
 	return new Response(JSON.stringify(settlement), {
-		status: response.status,
+		status: 200,
 		headers: paymentResponseHeaders(settlement),
 	});
 }
 
-async function handleDraftPay(
+async function handleStateChannelPay(
 	c: Context,
 	next: Next,
 	payload: X402PaymentPayload,
 	accepted: PaymentRequirements,
+	channelConfig: ChannelConfig,
 	channelState: DurableObjectNamespace,
 ): Promise<Response | void> {
 	const channelId = payload.payload?.channelId;
-	const cumulativeAmount = payload.payload?.cumulativeAmount;
-	const signature = payload.payload?.signature;
+	const iteration = payload.payload?.iteration;
+	const agentBalance = payload.payload?.agentBalance;
+	const serverBalance = payload.payload?.serverBalance;
+	const agentSig = payload.payload?.agentSig;
 	if (
 		typeof channelId !== 'string' ||
-		typeof cumulativeAmount !== 'string' ||
-		typeof signature !== 'string'
+		typeof iteration !== 'string' ||
+		typeof agentBalance !== 'string' ||
+		typeof serverBalance !== 'string' ||
+		typeof agentSig !== 'string'
 	) {
-		return c.json({ error: 'channel/pay requires channelId, cumulativeAmount, and signature' }, 400);
+		return c.json(
+			{ error: 'channel/pay requires channelId, iteration, agentBalance, serverBalance, and agentSig' },
+			400,
+		);
 	}
 
-	const stub = channelState.get(channelState.idFromName(channelId));
-	const settlementResponse = await stub.fetch('https://channel/pay', {
-		method: 'POST',
-		body: JSON.stringify({
+	const record = await getStoredChannel(channelState, channelId);
+	if (!record) {
+		return c.json({ success: false, error: 'channel/not-found' }, 404);
+	}
+
+	const verified = verifyStateChannelPayment(
+		{
+			scheme: 'channel',
 			channelId,
-			cumulativeAmount,
-			signature,
-			expectedAmount: accepted.amount,
-			networkPassphrase: networkPassphraseForNetwork(accepted.network),
-		}),
-	});
-	const settlement = (await settlementResponse.json()) as Record<string, unknown>;
-	if (!settlementResponse.ok) {
-		return new Response(JSON.stringify(settlement), {
-			status: settlementResponse.status,
-			headers: paymentResponseHeaders(settlement),
+			iteration,
+			agentBalance,
+			serverBalance,
+			agentSig,
+		},
+		record,
+		channelConfig,
+	);
+	if (!verified.ok) {
+		return new Response(JSON.stringify({ success: false, error: verified.error }), {
+			status: mapChannelErrorStatus(verified.error),
+			headers: { 'Content-Type': 'application/json' },
 		});
 	}
 
+	const updatedRecord: StoredChannelRecord = {
+		...record,
+		iteration,
+		agentBalance,
+		serverBalance,
+		agentSig,
+		serverSig: verified.payment.counterSig,
+		status: 'open',
+	};
+	await putStoredChannel(channelState, channelId, 'pay', updatedRecord);
+
 	await next();
 	if (c.res.status < 400) {
+		const responseHeader: ChannelPaymentResponse = {
+			scheme: 'channel',
+			channelId,
+			iteration,
+			serverSig: verified.payment.counterSig,
+		};
+		const settlement = {
+			success: true,
+			network: accepted.network,
+			channelId,
+			iteration,
+			currentCumulative: serverBalance,
+			remainingBalance: agentBalance,
+			serverSig: verified.payment.counterSig,
+		};
 		const headers = new Headers(c.res.headers);
 		headers.set('PAYMENT-RESPONSE', toBase64(JSON.stringify(settlement)));
+		headers.set('X-Payment-Response', JSON.stringify(responseHeader));
 		c.res = new Response(c.res.body, { status: c.res.status, statusText: c.res.statusText, headers });
 	}
+}
+
+async function handleStateChannelClose(
+	c: Context,
+	payload: X402PaymentPayload,
+	accepted: PaymentRequirements,
+	channelConfig: ChannelConfig,
+	channelState: DurableObjectNamespace,
+): Promise<Response> {
+	const channelId = payload.payload?.channelId;
+	const signature = payload.payload?.signature;
+	if (typeof channelId !== 'string' || typeof signature !== 'string') {
+		return c.json({ error: 'channel/close requires channelId and signature' }, 400);
+	}
+
+	const record = await getStoredChannel(channelState, channelId);
+	if (!record) {
+		return c.json({ success: false, error: 'channel/not-found' }, 404);
+	}
+	if (record.status !== 'open') {
+		return c.json({ success: false, error: 'channel/finalized' }, 410);
+	}
+	if (!verifyCloseIntentSignature(record.agentPublicKey, signature, channelId)) {
+		return c.json({ success: false, error: 'channel/invalid-signature' }, 402);
+	}
+
+	let transactionHash: string;
+	try {
+		transactionHash = await submitCloseChannelTransaction(channelConfig, record);
+	} catch (error) {
+		return c.json({ error: error instanceof Error ? error.message : String(error) }, 502);
+	}
+
+	const closedRecord: StoredChannelRecord = {
+		...record,
+		status: 'closed',
+		closedTxHash: transactionHash,
+	};
+	await putStoredChannel(channelState, channelId, 'close', closedRecord);
+
+	const settlement = {
+		success: true,
+		transaction: transactionHash,
+		network: accepted.network,
+		channelId,
+		iteration: record.iteration,
+		finalAmount: record.serverBalance,
+		refunded: record.agentBalance,
+	};
+	return new Response(JSON.stringify(settlement), {
+		status: 200,
+		headers: paymentResponseHeaders(settlement),
+	});
 }
 
 async function handleDemoChannelPayment(
@@ -309,25 +508,42 @@ async function handleDemoChannelPayment(
 	header: ChannelPaymentHeader,
 	config: ChannelConfig,
 ): Promise<Response | void> {
-	const result = verifyChannelPayment(header, config);
-	if (!result.valid) {
+	const deposit = header.deposit ?? (BigInt(header.serverBalance) + BigInt(header.agentBalance)).toString();
+	const record: StoredChannelRecord = {
+		channelId: header.channelId,
+		payer: 'legacy-demo',
+		payTo: 'legacy-demo',
+		asset: 'legacy-demo',
+		deposit,
+		agentPublicKey: header.agentPublicKey ?? '',
+		iteration: (BigInt(header.iteration) - 1n).toString(),
+		agentBalance: (BigInt(header.agentBalance) + config.price).toString(),
+		serverBalance: (BigInt(header.serverBalance) - config.price).toString(),
+		agentSig: header.agentSig,
+		serverSig: '',
+		openedTxHash: '',
+		status: 'open',
+	};
+	const result = verifyStateChannelPayment(header, record, config);
+	if (!result.ok) {
 		return c.json({ error: result.error }, 402);
 	}
 
 	await next();
-	if (c.res.status < 400 && result.counterSig) {
+	if (c.res.status < 400) {
 		const responseHeader: ChannelPaymentResponse = {
 			scheme: 'channel',
 			channelId: header.channelId,
 			iteration: header.iteration,
-			serverSig: result.counterSig,
+			serverSig: result.payment.counterSig,
 		};
 		const settlement = {
 			success: true,
 			channelId: header.channelId,
+			iteration: header.iteration,
 			currentCumulative: header.serverBalance,
 			remainingBalance: header.agentBalance,
-			iteration: header.iteration,
+			serverSig: result.payment.counterSig,
 		};
 		const headers = new Headers(c.res.headers);
 		headers.set('PAYMENT-RESPONSE', toBase64(JSON.stringify(settlement)));

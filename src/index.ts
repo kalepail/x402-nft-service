@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { Keypair } from '@stellar/stellar-sdk';
-import { ChannelStateDurableObject } from './channel-draft';
+import { ChannelStateDurableObject } from './channel-state';
 import { buildChannelRequirements, x402Middleware, type X402RouteConfig } from './x402';
 import type { ChannelConfig } from './channel';
 import { STYLES, STYLE_KEYS, type StyleKey, clampSize } from './generators';
@@ -13,18 +13,74 @@ const DEFAULT_FACILITATOR = 'https://x402.org/facilitator';
 const PRICE_AMOUNT = '10000'; // $0.001 USDC (7 decimals)
 const PRICE_BIGINT = 10_000n;
 const NETWORK = 'stellar:testnet';
+let didWarnChannelConfig = false;
 
 type Bindings = {
 	STELLAR_PAY_TO: string;
 	FACILITATOR_URL?: string;
 	/** Server secret key for counter-signing channel states. Set as a Worker secret. */
 	CHANNEL_SERVER_SECRET?: string;
+	/** Facilitator secret used to sponsor open transactions and submit closes. */
+	CHANNEL_FACILITATOR_SECRET?: string;
+	/** Real Soroban channel contract address backing x402 channel support. */
+	CHANNEL_CONTRACT_ID?: string;
+	/** Optional Soroban RPC override for channel relay operations. */
+	CHANNEL_RPC_URL?: string;
 	CHANNEL_STATE: DurableObjectNamespace;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
 
 app.use('*', cors());
+
+function warnChannelConfig(message: string, details: Record<string, unknown>): void {
+	if (didWarnChannelConfig) return;
+	didWarnChannelConfig = true;
+	console.warn(message, details);
+}
+
+function resolveChannelConfig(env: Bindings): ChannelConfig | undefined {
+	const serverSecret = env.CHANNEL_SERVER_SECRET?.trim() ?? '';
+	const facilitatorSecret = env.CHANNEL_FACILITATOR_SECRET?.trim() ?? '';
+	const channelContractId = env.CHANNEL_CONTRACT_ID?.trim() ?? '';
+	const rpcUrl =
+		env.CHANNEL_RPC_URL?.trim() || 'https://soroban-rpc.testnet.stellar.gateway.fm/';
+	const hasAnyChannelBinding =
+		typeof env.CHANNEL_SERVER_SECRET === 'string' ||
+		typeof env.CHANNEL_FACILITATOR_SECRET === 'string' ||
+		typeof env.CHANNEL_CONTRACT_ID === 'string';
+
+	if (!hasAnyChannelBinding) {
+		return undefined;
+	}
+
+	const missing: string[] = [];
+	if (!serverSecret) missing.push('CHANNEL_SERVER_SECRET');
+	if (!facilitatorSecret) missing.push('CHANNEL_FACILITATOR_SECRET');
+	if (!channelContractId) missing.push('CHANNEL_CONTRACT_ID');
+
+	if (missing.length > 0) {
+		warnChannelConfig('x402 channel support disabled due to missing or blank bindings', { missing });
+		return undefined;
+	}
+
+	try {
+		return {
+			serverKeypair: Keypair.fromSecret(serverSecret),
+			facilitatorKeypair: Keypair.fromSecret(facilitatorSecret),
+			price: PRICE_BIGINT,
+			channelContractId,
+			networkPassphrase: 'Test SDF Network ; September 2015',
+			rpcUrl,
+			suggestedDeposit: PRICE_BIGINT * 100n,
+		};
+	} catch (error) {
+		warnChannelConfig('x402 channel support disabled due to invalid channel binding values', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return undefined;
+	}
+}
 
 // ─── x402 payment gate on /mint/* ───────────────────────────────────────────
 
@@ -49,15 +105,7 @@ app.use('/mint/*', async (c, next) => {
 		};
 	}
 
-	// Enable channel scheme if server secret is configured
-	let channelConfig: ChannelConfig | undefined;
-	if (c.env.CHANNEL_SERVER_SECRET) {
-		channelConfig = {
-			serverKeypair: Keypair.fromSecret(c.env.CHANNEL_SERVER_SECRET),
-			price: PRICE_BIGINT,
-			suggestedDeposit: PRICE_BIGINT * 100n,
-		};
-	}
+	const channelConfig = resolveChannelConfig(c.env);
 
 	const mw = x402Middleware(facilitatorUrl, routeConfigs, channelConfig, c.env.CHANNEL_STATE);
 	return mw(c, next);
@@ -98,7 +146,7 @@ app.get('/openapi.json', (c) => {
 			description:
 				'Generates mathematically complex generative art (strange attractors, flow fields, hyperbolic tessellations, moire patterns) as PNG images. Minting requires an x402 micropayment of $0.001 USDC on Stellar testnet. Previews are free.',
 			'x-agent-instructions':
-				'To mint: GET /mint/{style}?seed={number}. The first request returns HTTP 402 with a PAYMENT-REQUIRED header. For exact, build a Stellar Soroban transfer transaction and retry with a payment-signature header. Experimental channel support is also advertised: send a channel open payload first, then reuse the returned channelId with pay commitments on later requests. Legacy stateless demo channel headers remain accepted for compatibility.',
+				'To mint: GET /mint/{style}?seed={number}. The first request returns HTTP 402 with a PAYMENT-REQUIRED header. For exact, build a Stellar Soroban transfer transaction and retry with a payment-signature header. When channel support is enabled, the same endpoint also accepts x402 channel actions backed by a real Soroban state channel contract: open with a signed open_channel transaction, pay with signed channel states, and close with a signed close intent. Legacy stateless demo channel headers remain accepted for compatibility.',
 		},
 		servers: [{ url: baseUrl }],
 		paths: {
@@ -152,7 +200,7 @@ app.get('/openapi.json', (c) => {
 				get: {
 					operationId: 'mintNFT',
 					summary: 'Mint a unique generative art PNG (x402 payment required: $0.001 USDC on Stellar testnet)',
-						description: `Requires x402 payment. First request without payment returns 402 with PAYMENT-REQUIRED header. Payment: ${PRICE_AMOUNT} stroops ($0.001 USDC, 7 decimals) on ${NETWORK} to ${payTo}. Exact and experimental channel schemes are advertised together when channel support is enabled.`,
+						description: `Requires x402 payment. First request without payment returns 402 with PAYMENT-REQUIRED header. Payment: ${PRICE_AMOUNT} stroops ($0.001 USDC, 7 decimals) on ${NETWORK} to ${payTo}. Exact and real channel schemes are advertised together when channel support is enabled.`,
 					parameters: [
 						{
 							name: 'style',
@@ -218,18 +266,14 @@ app.get('/.well-known/x402.json', (c) => {
 
 	const accepts: unknown[] = [exactScheme];
 
-	if (c.env.CHANNEL_SERVER_SECRET) {
-		const serverKeypair = Keypair.fromSecret(c.env.CHANNEL_SERVER_SECRET);
+	const channelConfig = resolveChannelConfig(c.env);
+	if (channelConfig) {
 		accepts.push(
 			buildChannelRequirements(
 				{
 					requirements: exactScheme,
 				},
-				{
-					serverKeypair,
-					price: PRICE_BIGINT,
-					suggestedDeposit: PRICE_BIGINT * 100n,
-				},
+				channelConfig,
 			),
 		);
 	}

@@ -11,7 +11,8 @@
 		"enabled": true
 	},
 	"compatibility_flags": [
-		"nodejs_compat"
+		"nodejs_compat",
+		"global_fetch_strictly_public"
 	],
 	"durable_objects": {
 		"bindings": [
@@ -29,6 +30,8 @@
 	],
 	"vars": {
 		"STELLAR_PAY_TO": "GBY77G2AKKMYAW4IVYILYYH5XCPSUL2ERKNQDV4E6QZLYEOUFRCX76IM",
-		"FACILITATOR_URL": "https://x402.org/facilitator"
+		"FACILITATOR_URL": "https://x402.org/facilitator",
+		"CHANNEL_CONTRACT_ID": "CBMUDNVJSVXUKIBAUTLT3R2XTLBM6SVRRXN6T7VG72XMKWV5JNDCRCZ2",
+		"CHANNEL_RPC_URL": "https://soroban-rpc.testnet.stellar.gateway.fm/"
 	}
 }

@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import { createHash } from 'node:crypto';
 import {
 	Account,
 	Address,
@@ -6,9 +7,8 @@ import {
 	Keypair,
 	Networks,
 	TransactionBuilder,
-	hash,
+	rpc,
 	nativeToScVal,
-	xdr,
 } from '@stellar/stellar-sdk';
 import { env, SELF } from 'cloudflare:test';
 import { describe, it, expect, vi, afterEach } from 'vitest';
@@ -31,6 +31,22 @@ function writeBigInt128BE(buf: Buffer, value: bigint, offset: number): void {
 	buf.writeBigUInt64BE(lo, offset + 8);
 }
 
+function stateMessage(
+	keypair: Keypair,
+	channelId: string,
+	iteration: bigint,
+	agentBalance: bigint,
+	serverBalance: bigint,
+): { signatureHex: string; message: Buffer } {
+	const channelIdBytes = Buffer.from(channelId, 'hex');
+	const buf = Buffer.alloc(72);
+	channelIdBytes.copy(buf, 0);
+	buf.writeBigUInt64BE(iteration, 32);
+	writeBigInt128BE(buf, agentBalance, 40);
+	writeBigInt128BE(buf, serverBalance, 56);
+	return { signatureHex: Buffer.from(keypair.sign(buf)).toString('hex'), message: buf };
+}
+
 function signDemoState(
 	keypair: Keypair,
 	channelId: string,
@@ -38,13 +54,7 @@ function signDemoState(
 	agentBalance: bigint,
 	serverBalance: bigint,
 ): string {
-	const channelIdBytes = Buffer.from(channelId, 'hex');
-	const buf = Buffer.alloc(72);
-	channelIdBytes.copy(buf, 0);
-	buf.writeBigUInt64BE(iteration, 32);
-	writeBigInt128BE(buf, agentBalance, 40);
-	writeBigInt128BE(buf, serverBalance, 56);
-	return Buffer.from(keypair.sign(buf)).toString('hex');
+	return stateMessage(keypair, channelId, iteration, agentBalance, serverBalance).signatureHex;
 }
 
 function makeDemoChannelPaymentSignature(): string {
@@ -73,35 +83,22 @@ function makeDemoChannelPaymentSignature(): string {
 	);
 }
 
-function buildDraftCommitmentBytes(channelId: string, amount: bigint): Buffer {
-	const entries = [
-		new xdr.ScMapEntry({
-			key: xdr.ScVal.scvSymbol('amount'),
-			val: nativeToScVal(amount, { type: 'i128' }),
-		}),
-		new xdr.ScMapEntry({
-			key: xdr.ScVal.scvSymbol('channel'),
-			val: new Address(channelId).toScVal(),
-		}),
-		new xdr.ScMapEntry({
-			key: xdr.ScVal.scvSymbol('domain'),
-			val: xdr.ScVal.scvSymbol('chancmmt'),
-		}),
-		new xdr.ScMapEntry({
-			key: xdr.ScVal.scvSymbol('network'),
-			val: xdr.ScVal.scvBytes(hash(Buffer.from(TESTNET_PASSPHRASE))),
-		}),
-	];
-	return Buffer.from(xdr.ScVal.scvMap(entries).toXDR());
+function deriveChannelId(agentPublicKey: string, nonce: Buffer): string {
+	return createHash('sha256')
+		.update(Buffer.from(Keypair.fromPublicKey(agentPublicKey).rawPublicKey()))
+		.update(nonce)
+		.digest('hex');
 }
 
-function buildDraftOpenTransaction(
-	factoryContract: string,
+function buildStateChannelOpenTransaction(
+	channelContract: string,
 	asset: string,
 	payTo: string,
+	serverPublicKey: string,
 	payer: Keypair,
-	commitment: Keypair,
+	agentKey: Keypair,
 	deposit: bigint,
+	nonce: Buffer,
 ): string {
 	const account = new Account(payer.publicKey(), '1');
 	return new TransactionBuilder(account, {
@@ -109,15 +106,15 @@ function buildDraftOpenTransaction(
 		networkPassphrase: TESTNET_PASSPHRASE,
 	})
 		.addOperation(
-			new Contract(factoryContract).call(
-				'open',
-				nativeToScVal(Buffer.alloc(32, 7)),
-				new Address(asset).toScVal(),
+			new Contract(channelContract).call(
+				'open_channel',
 				new Address(payer.publicKey()).toScVal(),
-				nativeToScVal(Buffer.from(commitment.rawPublicKey())),
+				nativeToScVal(Buffer.from(agentKey.rawPublicKey())),
 				new Address(payTo).toScVal(),
+				nativeToScVal(Buffer.from(Keypair.fromPublicKey(serverPublicKey).rawPublicKey())),
+				new Address(asset).toScVal(),
 				nativeToScVal(deposit, { type: 'i128' }),
-				nativeToScVal(24, { type: 'u32' }),
+				nativeToScVal(nonce),
 			),
 		)
 		.setTimeout(30)
@@ -126,37 +123,44 @@ function buildDraftOpenTransaction(
 		.toXDR('base64');
 }
 
-function makeDraftOpenPaymentSignature(
+function makeStateChannelOpenPaymentSignature(
 	channelAccept: Record<string, unknown>,
 	deposit: bigint,
 	payer: Keypair,
-	commitment: Keypair,
+	agentKey: Keypair,
 ): string {
+	const nonce = Buffer.alloc(32, 7);
+	const channelId = deriveChannelId(agentKey.publicKey(), nonce);
+	const initialStateSignature = signDemoState(agentKey, channelId, 0n, deposit, 0n);
 	return toBase64(
 		JSON.stringify({
 			x402Version: 2,
 			accepted: channelAccept,
 			payload: {
 				action: 'open',
-				transaction: buildDraftOpenTransaction(
-					channelAccept.extra.factoryContract as string,
+				transaction: buildStateChannelOpenTransaction(
+					channelAccept.extra.channelContract as string,
 					channelAccept.asset as string,
 					channelAccept.payTo as string,
+					channelAccept.extra.serverPublicKey as string,
 					payer,
-					commitment,
+					agentKey,
 					deposit,
+					nonce,
 				),
-				commitmentKey: commitment.publicKey(),
+				initialStateSignature,
 			},
 		}),
 	);
 }
 
-function makeDraftPayPaymentSignature(
+function makeStateChannelPayPaymentSignature(
 	channelAccept: Record<string, unknown>,
 	channelId: string,
-	commitment: Keypair,
-	cumulativeAmount: bigint,
+	agentKey: Keypair,
+	iteration: bigint,
+	agentBalance: bigint,
+	serverBalance: bigint,
 ): string {
 	return toBase64(
 		JSON.stringify({
@@ -165,14 +169,79 @@ function makeDraftPayPaymentSignature(
 			payload: {
 				action: 'pay',
 				channelId,
-				cumulativeAmount: cumulativeAmount.toString(),
-				signature: Buffer.from(
-					commitment.sign(buildDraftCommitmentBytes(channelId, cumulativeAmount)),
-				).toString('base64'),
+				iteration: iteration.toString(),
+				agentBalance: agentBalance.toString(),
+				serverBalance: serverBalance.toString(),
+				agentSig: signDemoState(agentKey, channelId, iteration, agentBalance, serverBalance),
 			},
 		}),
 	);
 }
+
+function makeStateChannelClosePaymentSignature(
+	channelAccept: Record<string, unknown>,
+	channelId: string,
+	agentKey: Keypair,
+): string {
+	return toBase64(
+		JSON.stringify({
+			x402Version: 2,
+			accepted: channelAccept,
+			payload: {
+				action: 'close',
+				channelId,
+				signature: Buffer.from(
+					agentKey.sign(Buffer.concat([Buffer.from(channelId, 'hex'), Buffer.from('close', 'utf8')])),
+				).toString('hex'),
+			},
+		}),
+	);
+}
+
+function mockChannelRpc(): void {
+	const originalFetch = globalThis.fetch;
+	vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+		const url = String(input);
+		if (
+			url === 'https://soroban-testnet.stellar.org' ||
+			url === 'https://soroban-rpc.testnet.stellar.gateway.fm' ||
+			url === 'https://soroban-rpc.testnet.stellar.gateway.fm/'
+		) {
+			const payload = JSON.parse(String(init?.body ?? '{}')) as { method?: string };
+			if (payload.method === 'sendTransaction') {
+				return new Response(
+					JSON.stringify({
+						jsonrpc: '2.0',
+						id: 'sendTransaction',
+						result: { hash: 'tx-hash-123', status: 'PENDING' },
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json' } },
+				);
+			}
+			if (payload.method === 'getTransaction') {
+				return new Response(
+					JSON.stringify({
+						jsonrpc: '2.0',
+						id: 'getTransaction',
+						result: { status: 'SUCCESS' },
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json' } },
+				);
+			}
+		}
+		return originalFetch(input, init);
+	});
+	vi.spyOn(rpc.Server.prototype, 'getAccount').mockImplementation(
+		async (accountId) => new Account(String(accountId), '1'),
+	);
+	vi.spyOn(rpc.Server.prototype, 'prepareTransaction').mockImplementation(
+		async (tx) => tx as Awaited<ReturnType<(typeof rpc.Server.prototype)['prepareTransaction']>>,
+	);
+}
+
+afterEach(() => {
+	vi.restoreAllMocks();
+});
 
 describe('free endpoints', () => {
 	it('GET / returns service info', async () => {
@@ -259,12 +328,14 @@ describe('discovery endpoints', () => {
 				expect(channel.amount).toBe('10000');
 				expect(channel.payTo).toBe(env.STELLAR_PAY_TO);
 				expect(channel.maxTimeoutSeconds).toBe(60);
-				expect((channel.extra as Record<string, unknown>).channelMode).toBe('hybrid-experimental');
-				expect((channel.extra as Record<string, unknown>).factoryContract).toBeTruthy();
-				expect((channel.extra as Record<string, unknown>).refundWaitingPeriod).toBe(24);
+				expect((channel.extra as Record<string, unknown>).channelMode).toBe('stellar-state-channel-v1');
+				expect((channel.extra as Record<string, unknown>).channelContract).toBeTruthy();
 				expect((channel.extra as Record<string, unknown>).serverPublicKey).toBeTruthy();
+				expect((channel.extra as Record<string, unknown>).supportsClose).toBe(true);
+				expect((channel.extra as Record<string, unknown>).supportsTopUp).toBe(false);
 				expect(channel.price).toBe('10000');
 				expect(channel.serverPublicKey).toBeTruthy();
+				expect(channel.channelContract).toBeTruthy();
 			}
 		}
 	});
@@ -373,7 +444,8 @@ describe('x402 payment gate', () => {
 		expect(resp.headers.get('PAYMENT-RESPONSE')).toBeTruthy();
 	});
 
-	it('opens an experimental draft channel and then accepts a pay action', async () => {
+	it('opens a real x402 state channel, accepts a pay action, and closes it on-chain', async () => {
+		mockChannelRpc();
 		const discoveryResp = await SELF.fetch('https://example.com/.well-known/x402.json');
 		const discovery = (await discoveryResp.json()) as Record<string, unknown>;
 		const endpoint = (discovery.endpoints as Array<Record<string, unknown>>).find(
@@ -384,12 +456,12 @@ describe('x402 payment gate', () => {
 		)!;
 
 		const payer = Keypair.random();
-		const commitment = Keypair.random();
+		const agentKey = Keypair.random();
 		const deposit = 1000000n;
 
 		const openResp = await SELF.fetch('https://example.com/mint/attractor', {
 			headers: {
-				'payment-signature': makeDraftOpenPaymentSignature(channelAccept, deposit, payer, commitment),
+				'payment-signature': makeStateChannelOpenPaymentSignature(channelAccept, deposit, payer, agentKey),
 			},
 		});
 		expect(openResp.status).toBe(200);
@@ -397,13 +469,18 @@ describe('x402 payment gate', () => {
 		expect(openBody.success).toBe(true);
 		expect(openBody.resourceGranted).toBe(false);
 		expect(typeof openBody.channelId).toBe('string');
+		expect(openBody.transaction).toBe('tx-hash-123');
+		expect(openBody.iteration).toBe('0');
+		expect(openBody.serverSig).toBeTruthy();
 
 		const payResp = await SELF.fetch('https://example.com/mint/attractor?seed=7', {
 			headers: {
-				'payment-signature': makeDraftPayPaymentSignature(
+				'payment-signature': makeStateChannelPayPaymentSignature(
 					channelAccept,
 					String(openBody.channelId),
-					commitment,
+					agentKey,
+					1n,
+					990000n,
 					10000n,
 				),
 			},
@@ -414,6 +491,26 @@ describe('x402 payment gate', () => {
 		expect(settlement.channelId).toBe(openBody.channelId);
 		expect(settlement.currentCumulative).toBe('10000');
 		expect(settlement.remainingBalance).toBe('990000');
+		expect(settlement.iteration).toBe('1');
+		expect(settlement.serverSig).toBeTruthy();
+		expect(payResp.headers.get('X-Payment-Response')).toBeTruthy();
+
+		const closeResp = await SELF.fetch('https://example.com/mint/attractor', {
+			headers: {
+				'payment-signature': makeStateChannelClosePaymentSignature(
+					channelAccept,
+					String(openBody.channelId),
+					agentKey,
+				),
+			},
+		});
+		expect(closeResp.status).toBe(200);
+		const closeBody = (await closeResp.json()) as Record<string, unknown>;
+		expect(closeBody.success).toBe(true);
+		expect(closeBody.channelId).toBe(openBody.channelId);
+		expect(closeBody.transaction).toBe('tx-hash-123');
+		expect(closeBody.finalAmount).toBe('10000');
+		expect(closeBody.refunded).toBe('990000');
 	});
 
 	it('returns PNG and settlement header when payment is valid', async () => {
@@ -462,6 +559,35 @@ describe('x402 payment gate', () => {
 			expect(settlement.transaction).toBe('abc123def456');
 		} finally {
 			globalThis.fetch = originalFetch;
+		}
+	});
+
+	it('warns and omits channel requirements when channel bindings are blank', async () => {
+		const originalServerSecret = env.CHANNEL_SERVER_SECRET;
+		const originalFacilitatorSecret = env.CHANNEL_FACILITATOR_SECRET;
+		const originalContractId = env.CHANNEL_CONTRACT_ID;
+		env.CHANNEL_SERVER_SECRET = '';
+		env.CHANNEL_FACILITATOR_SECRET = '';
+		env.CHANNEL_CONTRACT_ID = '';
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+		try {
+			const resp = await SELF.fetch('https://example.com/.well-known/x402.json');
+			expect(resp.status).toBe(200);
+			const body = (await resp.json()) as Record<string, unknown>;
+			const endpoints = body.endpoints as Array<Record<string, unknown>>;
+			for (const ep of endpoints) {
+				const accepts = ep.accepts as Array<Record<string, unknown>>;
+				expect(accepts.find((a) => a.scheme === 'channel')).toBeUndefined();
+			}
+			expect(warn).toHaveBeenCalledWith(
+				'x402 channel support disabled due to missing or blank bindings',
+				{ missing: ['CHANNEL_SERVER_SECRET', 'CHANNEL_FACILITATOR_SECRET', 'CHANNEL_CONTRACT_ID'] },
+			);
+		} finally {
+			env.CHANNEL_SERVER_SECRET = originalServerSecret;
+			env.CHANNEL_FACILITATOR_SECRET = originalFacilitatorSecret;
+			env.CHANNEL_CONTRACT_ID = originalContractId;
 		}
 	});
 });
