@@ -211,15 +211,20 @@ async function putStoredChannel(
 	channelId: string,
 	endpoint: 'open' | 'pay' | 'close',
 	record: StoredChannelRecord,
-): Promise<void> {
+): Promise<{ ok: true } | { ok: false; error: string }> {
 	const stub = channelState.get(channelState.idFromName(channelId));
 	const response = await stub.fetch(`https://channel/${endpoint}`, {
 		method: 'POST',
 		body: JSON.stringify(record),
 	});
+	if (response.status === 409) {
+		const body = (await response.json()) as { error: string };
+		return { ok: false, error: body.error ?? 'channel/conflict' };
+	}
 	if (!response.ok) {
 		throw new Error(`channel state update failed: ${await response.text()}`);
 	}
+	return { ok: true };
 }
 
 function mapChannelErrorStatus(error: string): number {
@@ -333,6 +338,7 @@ async function handleStateChannelOpen(
 		payer: parsed.payer,
 		payTo: parsed.payTo,
 		asset: parsed.asset,
+		price: String(channelConfig.price),
 		deposit: parsed.deposit,
 		agentPublicKey: parsed.agentPublicKey,
 		iteration: '0',
@@ -343,7 +349,10 @@ async function handleStateChannelOpen(
 		openedTxHash: transactionHash,
 		status: 'open',
 	};
-	await putStoredChannel(channelState, parsed.channelId, 'open', record);
+	const openResult = await putStoredChannel(channelState, parsed.channelId, 'open', record);
+	if (!openResult.ok) {
+		return c.json({ error: openResult.error }, 409);
+	}
 
 	const settlement = {
 		success: true,
@@ -394,25 +403,41 @@ async function handleStateChannelPay(
 	if (!record) {
 		return c.json({ success: false, error: 'channel/not-found' }, 404);
 	}
-
-	const verified = verifyStateChannelPayment(
-		{
-			scheme: 'channel',
-			channelId,
-			iteration,
-			agentBalance,
-			serverBalance,
-			agentSig,
-		},
-		record,
-		channelConfig,
-	);
-	if (!verified.ok) {
-		return new Response(JSON.stringify({ success: false, error: verified.error }), {
-			status: mapChannelErrorStatus(verified.error),
+	if (record.status !== 'open') {
+		return new Response(JSON.stringify({ success: false, error: 'channel/finalized' }), {
+			status: 410,
 			headers: { 'Content-Type': 'application/json' },
 		});
 	}
+
+	// Verify the agent's signature against the claimed state (stateless — no race condition).
+	// Ordering (iteration + balance delta) is enforced atomically inside the DO.
+	const iterBig = BigInt(iteration);
+	const agentBalBig = BigInt(agentBalance);
+	const serverBalBig = BigInt(serverBalance);
+	const depositBig = BigInt(record.deposit);
+
+	if (agentBalBig < 0n || serverBalBig < 0n || agentBalBig + serverBalBig !== depositBig) {
+		return new Response(JSON.stringify({ success: false, error: 'channel/bad-balances' }), {
+			status: 402,
+			headers: { 'Content-Type': 'application/json' },
+		});
+	}
+
+	let sigValid: boolean;
+	try {
+		sigValid = verifyStateSignature(record.agentPublicKey, agentSig, record.channelId, iterBig, agentBalBig, serverBalBig);
+	} catch {
+		sigValid = false;
+	}
+	if (!sigValid) {
+		return new Response(JSON.stringify({ success: false, error: 'channel/invalid-signature' }), {
+			status: 402,
+			headers: { 'Content-Type': 'application/json' },
+		});
+	}
+
+	const counterSig = signStateHex(channelConfig.serverKeypair, record.channelId, iterBig, agentBalBig, serverBalBig);
 
 	const updatedRecord: StoredChannelRecord = {
 		...record,
@@ -420,10 +445,18 @@ async function handleStateChannelPay(
 		agentBalance,
 		serverBalance,
 		agentSig,
-		serverSig: verified.payment.counterSig,
+		serverSig: counterSig,
 		status: 'open',
 	};
-	await putStoredChannel(channelState, channelId, 'pay', updatedRecord);
+	// The DO enforces iteration ordering atomically — concurrent requests queue inside the DO
+	// and each sees the state written by the previous one, so all succeed in order.
+	const putResult = await putStoredChannel(channelState, channelId, 'pay', updatedRecord);
+	if (!putResult.ok) {
+		return new Response(JSON.stringify({ success: false, error: putResult.error }), {
+			status: mapChannelErrorStatus(putResult.error),
+			headers: { 'Content-Type': 'application/json' },
+		});
+	}
 
 	await next();
 	if (c.res.status < 400) {
@@ -431,7 +464,7 @@ async function handleStateChannelPay(
 			scheme: 'channel',
 			channelId,
 			iteration,
-			serverSig: verified.payment.counterSig,
+			serverSig: counterSig,
 		};
 		const settlement = {
 			success: true,
@@ -440,7 +473,7 @@ async function handleStateChannelPay(
 			iteration,
 			currentCumulative: serverBalance,
 			remainingBalance: agentBalance,
-			serverSig: verified.payment.counterSig,
+			serverSig: counterSig,
 		};
 		const headers = new Headers(c.res.headers);
 		headers.set('PAYMENT-RESPONSE', toBase64(JSON.stringify(settlement)));
@@ -485,7 +518,9 @@ async function handleStateChannelClose(
 		status: 'closed',
 		closedTxHash: transactionHash,
 	};
-	await putStoredChannel(channelState, channelId, 'close', closedRecord);
+	await putStoredChannel(channelState, channelId, 'close', closedRecord).catch((err) => {
+		console.error('close state update failed (non-fatal):', err);
+	});
 
 	const settlement = {
 		success: true,

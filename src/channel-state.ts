@@ -34,9 +34,25 @@ export class ChannelStateDurableObject extends DurableObject {
 		}
 
 		if (url.pathname === '/pay') {
-			const record = (await request.json()) as StoredChannelRecord;
-			await this.ctx.storage.put('channel', record);
-			return Response.json(record);
+			const newRecord = (await request.json()) as StoredChannelRecord;
+			const existing = await this.ctx.storage.get<StoredChannelRecord>('channel');
+			if (!existing || existing.status !== 'open') {
+				return Response.json({ error: 'channel/not-found' }, { status: 404 });
+			}
+			if (BigInt(newRecord.iteration) !== BigInt(existing.iteration) + 1n) {
+				return Response.json(
+					{ error: 'channel/bad-iteration', currentIteration: existing.iteration },
+					{ status: 409 },
+				);
+			}
+			if (existing.price !== undefined) {
+				const delta = BigInt(newRecord.serverBalance) - BigInt(existing.serverBalance);
+				if (delta !== BigInt(existing.price)) {
+					return Response.json({ error: 'channel/amount-mismatch' }, { status: 409 });
+				}
+			}
+			await this.ctx.storage.put('channel', newRecord);
+			return Response.json(newRecord);
 		}
 
 		if (url.pathname === '/close') {

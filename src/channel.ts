@@ -45,6 +45,7 @@ export interface StoredChannelRecord extends ChannelStateSnapshot {
 	payer: string;
 	payTo: string;
 	asset: string;
+	price?: string;
 	openedTxHash: string;
 	closedTxHash?: string;
 	status: 'open' | 'closed';
